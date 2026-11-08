@@ -27,6 +27,16 @@ Webmin module for managing Apache + ModSecurity on Ubuntu 24.04 or newer servers
   threshold, checked by a cron job in `/etc/cron.d/webmin-modsec-manager`
   - HTML e-mail with a plain-text fallback, sent through the local `sendmail`; preview it
     from the Alerts page without sending
+- **Blocked IPs**: block an attacker address in up to three places, with an end time
+  (1 hour to 30 days, or until removed) lifted by a cron job
+  - **Cloudflare**: an account-level IP Access Rule (block or managed challenge) for every
+    proxied site; needs an API token with *Account Firewall Access Rules: Edit*
+  - **ModSecurity**: `@ipMatchFromFile` list in `/etc/modsecurity/modsec-ip-blocklist.txt`
+    (rule id 1100110), config-tested, then Apache is reloaded
+  - **ufw**: deny on all ports; only stops direct connections, not traffic via Cloudflare
+  - Cloudflare, private, loopback, this server's and never-block addresses are refused,
+    as is the address you use Webmin from
+  - *Likely attackers* on the Logs page get a Block button
 - **AI bots**: block (403) or only log known AI crawlers by User-Agent, grouped as
   training crawlers (GPTBot, ClaudeBot, CCBot, Bytespider, ...), AI search crawlers and
   user-triggered fetchers (ChatGPT-User, Claude-User, ...)

@@ -54,6 +54,7 @@ sub paths {
         a2dismod               => cfg('a2dismod', '/usr/sbin/a2dismod'),
         a2enconf               => cfg('a2enconf', '/usr/sbin/a2enconf'),
         a2disconf              => cfg('a2disconf', '/usr/sbin/a2disconf'),
+        ufw                    => cfg('ufw', '/usr/sbin/ufw'),
         apt_get                => cfg('apt_get', '/usr/bin/apt-get'),
         dpkg_query             => cfg('dpkg_query', '/usr/bin/dpkg-query'),
         rule_dirs              => cfg('rule_dirs', '/etc/modsecurity,/etc/modsecurity/crs,/usr/share/modsecurity-crs,/usr/share/modsecurity-crs/rules'),
@@ -2386,6 +2387,391 @@ sub ai_bot_hits {
 }
 
 # ---------------------------------------------------------------------------
+# Blocking attacker addresses
+# ---------------------------------------------------------------------------
+# One block can go to three places:
+#  - cloudflare: an account-level IP Access Rule, so requests are refused at
+#    Cloudflare's edge for every proxied site in the account;
+#  - modsec: a deny rule that reads a list of addresses. It works for proxied
+#    and direct traffic alike, because mod_remoteip hands ModSecurity the
+#    visitor's address. Apache is reloaded to pick up a changed list;
+#  - ufw: a deny rule for all ports. The firewall only sees the address that
+#    connects, so it stops direct connections, not traffic via Cloudflare.
+# Blocks are recorded in blocks.json in the module config directory. Blocks
+# with an end time are lifted by block_expire.pl from cron.
+
+# Never blocked: private, loopback, link-local, CGNAT, multicast/reserved.
+my @NEVER_BLOCK = qw(0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12
+                     192.168.0.0/16 224.0.0.0/3 ::/128 ::1/128 fc00::/7 fe80::/10 ff00::/8);
+
+sub block_target_names {
+    return (cloudflare => 'Cloudflare', modsec => 'ModSecurity', ufw => 'ufw firewall');
+}
+
+sub block_settings {
+    my $mode = cfg('block_cf_mode', 'block');
+    my $dur = cfg('block_duration', 24);
+    return (
+        cf_token   => cfg('block_cf_token', ''),
+        cf_account => cfg('block_cf_account', ''),
+        cf_mode    => $mode =~ /^(?:block|managed_challenge)$/ ? $mode : 'block',
+        targets    => [ grep { /^(?:cloudflare|modsec|ufw)$/ } split(/\s*,\s*/, cfg('block_targets', 'cloudflare,modsec')) ],
+        duration   => $dur =~ /^\d+$/ ? $dur : 24,
+        whitelist  => [ grep { cidr_parse($_) } split(/[\s,]+/, cfg('block_whitelist', '')) ],
+        rule_file  => cfg('block_modsec_file', '/etc/modsecurity/modsec-ip-blocklist.conf'),
+        data_file  => cfg('block_modsec_data', '/etc/modsecurity/modsec-ip-blocklist.txt'),
+        ufw        => cfg('ufw', '/usr/sbin/ufw'),
+        cron_file  => cfg('block_cron_file', '/etc/cron.d/webmin-modsec-manager-blocks'),
+    );
+}
+
+# Why each target cannot be used right now ('' when it can).
+sub block_target_problems {
+    my (%s) = @_;
+    return (
+        cloudflare => !$s{cf_token} ? 'No Cloudflare API token yet (see Settings below)'
+                    : $s{cf_account} !~ /^[0-9a-f]{32}$/ ? 'No Cloudflare account ID yet (see Settings below)' : '',
+        modsec     => '',
+        ufw        => -x $s{ufw} ? '' : "ufw is not installed ($s{ufw})",
+    );
+}
+
+# Normalised text form of an address (lower case, IPv6 compressed), or undef.
+sub ip_canonical {
+    my ($ip) = @_;
+    return undef if (!defined($ip) || $ip =~ m#/#);
+    my $b = ip_pack($ip);
+    return undef if (!defined($b));
+    require Socket;
+    return Socket::inet_ntop(length($b) == 4 ? Socket::AF_INET() : Socket::AF_INET6(), $b);
+}
+
+sub server_addresses {
+    foreach my $h ('/usr/bin/hostname', '/bin/hostname') {
+        next if (!-x $h);
+        my ($code, $out) = run_command_list($h, '-I');
+        return grep { defined } map { ip_canonical($_) } split(/\s+/, $out) if ($code == 0);
+    }
+    return ();
+}
+
+# Why $ip must not be blocked, or '' if it may be.
+sub block_refusal {
+    my ($ip, %s) = @_;
+    return "Enter one IPv4 or IPv6 address (not a range)" if (!defined(ip_canonical($ip)));
+    my $c = ip_canonical($ip);
+    my ($cf) = cf_ip_ranges(0);
+    return "$c is a Cloudflare address. Blocking it would cut off visitors who reach your sites through Cloudflare."
+        if (ip_in_ranges($c, [ map { cidr_parse($_) } @$cf ]));
+    return "$c is a private, loopback or reserved address." if (ip_in_ranges($c, [ map { cidr_parse($_) } @NEVER_BLOCK ]));
+    return "$c is one of this server's own addresses." if (grep { $_ eq $c } server_addresses());
+    my $me = ip_canonical($ENV{'REMOTE_ADDR'});
+    return "$c is the address you are using Webmin from." if ($me && $me eq $c);
+    return "$c is on the never-block list." if (ip_in_ranges($c, [ map { cidr_parse($_) } @{$s{whitelist}} ]));
+    return '';
+}
+
+sub blocks_file {
+    return ($module_config_directory || "/etc/webmin/modsec-manager") . "/blocks.json";
+}
+
+# List of { ip, reason, by, added, expires (0 = never), targets => {
+#   cloudflare => { id, preexisting }, modsec => 1, ufw => 1 } }.
+sub read_blocks {
+    my $d = read_text_file(blocks_file());
+    return [] if ($d !~ /\S/);
+    my $j = eval { require JSON::PP; JSON::PP->new->decode($d) };
+    return ref($j) eq 'ARRAY' ? [ grep { ref($_) eq 'HASH' && defined(ip_canonical($_->{ip})) } @$j ] : [];
+}
+
+sub write_blocks {
+    my ($list) = @_;
+    require JSON::PP;
+    write_text_file(blocks_file(), JSON::PP->new->canonical->pretty->encode($list), 0600);
+}
+
+# --- Cloudflare ---------------------------------------------------------------
+
+# Call the Cloudflare API. Returns ($ok, $json, $error, \@error_codes).
+sub cf_api {
+    my ($method, $path, $body, %s) = @_;
+    require JSON::PP;
+    my $json = defined($body) ? JSON::PP->new->canonical->encode($body) : undef;
+    my ($ok, $content, $err, $status) = https_request($method, "https://api.cloudflare.com/client/v4$path",
+        { 'Authorization' => "Bearer $s{cf_token}", (defined($json) ? ('Content-Type' => 'application/json') : ()) }, $json);
+    my $j = eval { JSON::PP->new->decode($content || '') };
+    if (ref($j) eq 'HASH') {
+        my @e = grep { ref($_) eq 'HASH' } (ref($j->{errors}) eq 'ARRAY' ? @{$j->{errors}} : ());
+        my $msg = join('; ', map { ($_->{message} || 'error') . ($_->{code} ? " (code $_->{code})" : '') } @e);
+        return (1, $j, '', []) if ($j->{success});
+        return (0, $j, $msg || $err || "HTTP $status", [ map { $_->{code} || 0 } @e ]);
+    }
+    return (0, undef, $err || "Unexpected answer from the Cloudflare API", []);
+}
+
+sub cf_rules_path {
+    my (%s) = @_;
+    return "/accounts/$s{cf_account}/firewall/access_rules/rules";
+}
+
+# Account ID when the token sees exactly one account. Returns ($id, $message).
+sub cf_detect_account {
+    my (%s) = @_;
+    my ($ok, $j, $err) = cf_api('GET', '/accounts?per_page=5', undef, %s);
+    return (undef, "Could not list accounts: $err") if (!$ok);
+    my @a = grep { ref($_) eq 'HASH' && ($_->{id} || '') =~ /^[0-9a-f]{32}$/ } (ref($j->{result}) eq 'ARRAY' ? @{$j->{result}} : ());
+    return (undef, "The token cannot see any account. Enter the account ID by hand.") if (!@a);
+    return (undef, "The token can see " . scalar(@a) . " accounts. Enter the account ID by hand.") if (@a > 1);
+    return ($a[0]{id}, "Found account " . ($a[0]{name} || $a[0]{id}) . ".");
+}
+
+sub cf_test_connection {
+    my (%s) = @_;
+    my ($ok, $j, $err) = cf_api('GET', cf_rules_path(%s) . '?per_page=1', undef, %s);
+    return (0, "Cloudflare refused the request: $err") if (!$ok);
+    my $n = ref($j->{result_info}) eq 'HASH' ? ($j->{result_info}{total_count} || 0) : 0;
+    return (1, "Connected. The token can read this account's IP Access Rules ($n now).");
+}
+
+# Returns ($ok, $rule_id, $message, $preexisting).
+sub cf_block_ip {
+    my ($ip, $note, %s) = @_;
+    my $target = index($ip, ':') >= 0 ? 'ip6' : 'ip';
+    my ($ok, $j, $err, $codes) = cf_api('POST', cf_rules_path(%s),
+        { mode => $s{cf_mode}, configuration => { target => $target, value => $ip }, notes => $note }, %s);
+    if ($ok && ref($j->{result}) eq 'HASH' && $j->{result}{id}) {
+        return (1, $j->{result}{id}, ($s{cf_mode} eq 'block' ? "Blocked" : "Managed challenge") .
+                                     " for every proxied site in the account", 0);
+    }
+    if ((grep { $_ == 10009 } @$codes) || $err =~ /duplicate|already exists/i) {
+        my ($fok, $fj) = cf_api('GET', cf_rules_path(%s) . "?configuration.target=$target&configuration.value=" .
+                                url_escape($ip), undef, %s);
+        my ($r) = $fok && ref($fj->{result}) eq 'ARRAY' ? @{$fj->{result}} : ();
+        return (1, $r->{id}, "A rule for this address already existed (mode " . ($r->{mode} || '?') .
+                             "); it is left in place when you unblock", 1) if ($r && $r->{id});
+    }
+    return (0, undef, $err, 0);
+}
+
+sub cf_unblock_ip {
+    my ($t, %s) = @_;
+    return (1, "Left the rule that existed before") if ($t->{preexisting});
+    return (1, "No rule to remove") if (($t->{id} || '') !~ /^[0-9a-f]{32}$/);
+    my ($ok, $j, $err) = cf_api('DELETE', cf_rules_path(%s) . "/$t->{id}", undef, %s);
+    return (1, "Rule removed") if ($ok);
+    return (1, "Rule was already gone") if ($err =~ /not found|HTTP 404|code 10007/i);
+    return (0, $err);
+}
+
+# --- ModSecurity ----------------------------------------------------------------
+
+sub modsec_block_rule_text {
+    my (%s) = @_;
+    return "# Blocked addresses.\n" .
+           "# Managed by Webmin ModSecurity Manager (Blocked IPs page); changes here are overwritten.\n" .
+           "# Rule ids 1100110-1100119 are reserved for this file. The addresses are in\n" .
+           "# $s{data_file}, which is read when Apache starts or reloads.\n" .
+           "SecRule REMOTE_ADDR \"\@ipMatchFromFile $s{data_file}\" \\\n" .
+           "    \"id:1100110,phase:1,deny,status:403,log,auditlog,t:none,severity:'NOTICE',\\\n" .
+           "    msg:'Address on the ModSecurity Manager blocklist',tag:'modsec-manager/ip-block'\"\n";
+}
+
+# Write the address list (and the rule file, or remove it when the list is
+# empty), test the config and reload Apache. Puts everything back if the
+# test fails. Returns ($ok, $message).
+sub modsec_apply_blocks {
+    my ($blocks, %s) = @_;
+    my %p = paths();
+    my @ips = sort map { $_->{ip} } grep { $_->{targets}{modsec} } @$blocks;
+    my $data = join('', map { "$_\n" } @ips);
+    my $rule = @ips ? modsec_block_rule_text(%s) : undef;
+    my $old_data = -e $s{data_file} ? read_text_file($s{data_file}) : undef;
+    my $old_rule = -e $s{rule_file} ? read_text_file($s{rule_file}) : undef;
+    return (1, "Blocklist unchanged") if (($old_data // '') eq $data && ($old_rule // "\0") eq ($rule // "\0"));
+    -d File::Basename::dirname($s{data_file}) || return (0, "Directory not found: " . File::Basename::dirname($s{data_file}));
+
+    my ($inc_backup, $inc_added);
+    write_text_file($s{data_file}, $data, 0644);
+    if (defined($rule)) {
+        write_text_file($s{rule_file}, $rule, 0644);
+        if (!modsec_file_included($s{rule_file})) {
+            my $conf = read_text_file($p{modsecurity_conf});
+            $inc_backup = backup_file($p{modsecurity_conf});
+            $conf .= "\n" if ($conf ne '' && substr($conf, -1) ne "\n");
+            write_text_file($p{modsecurity_conf}, $conf . "\n# IP blocklist managed by Webmin\nIncludeOptional $s{rule_file}\n", 0644);
+            $inc_added = 1;
+        }
+    } elsif (-e $s{rule_file}) {
+        unlink($s{rule_file});
+    }
+    my ($code, $out) = apache_configtest();
+    if ($code != 0) {
+        defined($old_data) ? write_text_file($s{data_file}, $old_data, 0644) : unlink($s{data_file});
+        defined($old_rule) ? write_text_file($s{rule_file}, $old_rule, 0644) : unlink($s{rule_file});
+        restore_backup($p{modsecurity_conf}, $inc_backup) if ($inc_added);
+        return (0, "Config test failed, so the blocklist was left as it was:\n$out");
+    }
+    my ($rc, $rout) = run_command_list($p{systemctl}, 'reload', 'apache2');
+    return (0, "Blocklist saved, but reloading Apache failed:\n$rout") if ($rc != 0);
+    return (1, scalar(@ips) . (@ips == 1 ? " address" : " addresses") . " on the blocklist; Apache reloaded");
+}
+
+# --- ufw ------------------------------------------------------------------------
+
+sub ufw_block_ip {
+    my ($ip, %s) = @_;
+    my ($c, $o) = run_command_list($s{ufw}, 'prepend', 'deny', 'from', $ip, 'comment', 'modsec-manager');
+    ($c, $o) = run_command_list($s{ufw}, 'insert', '1', 'deny', 'from', $ip, 'comment', 'modsec-manager')
+        if ($c != 0 && $o =~ /prepend|invalid syntax/i);
+    $o =~ s/\s+$//;
+    return (0, $o || "ufw failed") if ($c != 0);
+    my ($sc, $so) = run_command_list($s{ufw}, 'status');
+    return (1, "Denied on all ports" . ($so =~ /Status:\s*active/i ? "" : " (ufw is not active, so the rule has no effect yet)"));
+}
+
+# Delete this module's deny rules for $ip, highest rule number first.
+sub ufw_unblock_ip {
+    my ($ip, %s) = @_;
+    my ($c, $o) = run_command_list($s{ufw}, 'status', 'numbered');
+    return (0, "ufw status failed: $o") if ($c != 0);
+    my @nums;
+    foreach my $l (split(/\n/, $o)) {
+        my ($n) = $l =~ /^\[\s*(\d+)\]/;
+        next if (!$n || $l !~ /#\s*modsec-manager\b/);
+        push(@nums, $n) if (grep { defined(ip_canonical($_)) && ip_canonical($_) eq $ip } split(/\s+/, $l));
+    }
+    return (1, "No rule to remove") if (!@nums);
+    foreach my $n (sort { $b <=> $a } @nums) {
+        my ($dc, $do) = run_command_list($s{ufw}, '--force', 'delete', $n);
+        return (0, "ufw delete $n failed: $do") if ($dc != 0);
+    }
+    return (1, "Removed " . plural(scalar(@nums), 'rule'));
+}
+
+# --- Block, unblock, expire ---------------------------------------------------
+
+sub fmt_time {
+    my ($t) = @_;
+    return POSIX::strftime("%d %b %Y %H:%M", localtime($t));
+}
+
+# Block $ip on @$targets. Returns ($blocked_somewhere, \@results) where each
+# result is [target, ok, message].
+sub block_ip {
+    my ($ip, $reason, $hours, $targets, $user) = @_;
+    my %s = block_settings();
+    my %bad = block_target_problems(%s);
+    $ip = ip_canonical($ip);
+    $reason = substr(defined($reason) ? $reason : '', 0, 200);
+    $reason =~ s/[\r\n\t]+/ /g;
+    &lock_file(blocks_file());
+    my $list = read_blocks();
+    my ($rec) = grep { $_->{ip} eq $ip } @$list;
+    if (!$rec) {
+        $rec = { ip => $ip, added => time(), targets => {} };
+        push(@$list, $rec);
+    }
+    $rec->{reason} = $reason;
+    $rec->{by} = $user || '';
+    $rec->{expires} = $hours ? time() + $hours * 3600 : 0;
+    my $note = "ModSecurity Manager: " . ($reason ne '' ? $reason : 'blocked') .
+               ($hours ? " (until " . fmt_time($rec->{expires}) . ")" : "");
+    my (@res, $modsec);
+    foreach my $t (@$targets) {
+        if ($rec->{targets}{$t}) {
+            push(@res, [$t, 1, "Already blocked here"]);
+        } elsif ($bad{$t}) {
+            push(@res, [$t, 0, $bad{$t}]);
+        } elsif ($t eq 'cloudflare') {
+            my ($ok, $id, $msg, $pre) = cf_block_ip($ip, substr($note, 0, 500), %s);
+            push(@res, [$t, $ok, $msg]);
+            $rec->{targets}{cloudflare} = { id => $id, preexisting => $pre ? 1 : 0 } if ($ok);
+        } elsif ($t eq 'ufw') {
+            my ($ok, $msg) = ufw_block_ip($ip, %s);
+            push(@res, [$t, $ok, $msg]);
+            $rec->{targets}{ufw} = 1 if ($ok);
+        } elsif ($t eq 'modsec') {
+            $rec->{targets}{modsec} = 1;
+            $modsec = 1;
+        }
+    }
+    if ($modsec) {
+        my ($ok, $msg) = modsec_apply_blocks($list, %s);
+        push(@res, ['modsec', $ok, $msg]);
+        delete($rec->{targets}{modsec}) if (!$ok);
+    }
+    @$list = grep { %{$_->{targets}} } @$list;
+    write_blocks($list);
+    &unlock_file(blocks_file());
+    sync_block_cron(%s);
+    return (%{$rec->{targets}} ? 1 : 0, \@res);
+}
+
+# Lift the blocks on @$ips everywhere. A block that cannot be removed from
+# some target stays listed for that target. Returns \@results, each
+# [ip, target, ok, message].
+sub unblock_ips {
+    my ($ips) = @_;
+    my %s = block_settings();
+    my %want = map { ip_canonical($_) => 1 } grep { defined(ip_canonical($_)) } @$ips;
+    &lock_file(blocks_file());
+    my $list = read_blocks();
+    my (@res, @modsec);
+    foreach my $rec (grep { $want{$_->{ip}} } @$list) {
+        my $t = $rec->{targets};
+        if ($t->{cloudflare}) {
+            my ($ok, $msg) = cf_unblock_ip($t->{cloudflare}, %s);
+            push(@res, [$rec->{ip}, 'cloudflare', $ok, $msg]);
+            delete($t->{cloudflare}) if ($ok);
+        }
+        if ($t->{ufw}) {
+            my ($ok, $msg) = -x $s{ufw} ? ufw_unblock_ip($rec->{ip}, %s) : (1, "ufw is no longer installed");
+            push(@res, [$rec->{ip}, 'ufw', $ok, $msg]);
+            delete($t->{ufw}) if ($ok);
+        }
+        if ($t->{modsec}) {
+            delete($t->{modsec});
+            push(@modsec, $rec);
+        }
+    }
+    if (@modsec) {
+        my ($ok, $msg) = modsec_apply_blocks($list, %s);
+        if (!$ok) {
+            $_->{targets}{modsec} = 1 foreach (@modsec);
+        }
+        push(@res, [join(', ', map { $_->{ip} } @modsec), 'modsec', $ok, $msg]);
+    }
+    @$list = grep { %{$_->{targets}} } @$list;
+    write_blocks($list);
+    &unlock_file(blocks_file());
+    sync_block_cron(%s);
+    return \@res;
+}
+
+# Lift every block whose end time has passed. Returns \@results.
+sub expire_blocks {
+    my $now = time();
+    my @due = map { $_->{ip} } grep { $_->{expires} && $_->{expires} <= $now } @{read_blocks()};
+    return [] if (!@due);
+    return unblock_ips(\@due);
+}
+
+# Cron job that lifts expired blocks; only installed while a block has an end time.
+sub sync_block_cron {
+    my (%s) = @_;
+    if (!grep { $_->{expires} } @{read_blocks()}) {
+        unlink($s{cron_file}) if (-e $s{cron_file});
+        return;
+    }
+    my $root = $module_root_directory || Cwd::getcwd();
+    my $cfgdir = $config_directory || '/etc/webmin';
+    my $var = $var_directory || '/var/webmin';
+    my $line = "# Lift expired IP blocks, managed by Webmin ModSecurity Manager\n" .
+               "*/10 * * * * root cd $root && WEBMIN_CONFIG=$cfgdir WEBMIN_VAR=$var /usr/bin/perl $root/block_expire.pl >/dev/null 2>&1\n";
+    write_text_file($s{cron_file}, $line, 0644) if (read_text_file($s{cron_file}) ne $line);
+}
+
+# ---------------------------------------------------------------------------
 # HTML helpers and design system
 # ---------------------------------------------------------------------------
 
@@ -2429,6 +2815,7 @@ my %ICONS = (
     arrow    => '<path d="M5 12h14M13 6l6 6-6 6"/>',
     cloud    => '<path d="M7 18.5h10.5a4 4 0 0 0 .4-7.98A6 6 0 0 0 6.3 9.1 4.7 4.7 0 0 0 7 18.5z"/>',
     bot      => '<rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 4v4M9 13h.01M15 13h.01M9.5 17h5"/>',
+    ban      => '<circle cx="12" cy="12" r="9"/><path d="M5.7 5.7l12.6 12.6"/>',
 );
 sub icon {
     my ($name, $size) = @_;
@@ -2711,6 +3098,7 @@ sub print_nav {
         ['index.cgi',      'Status',      'gauge'],
         ['sites.cgi',      'Sites',       'globe'],
         ['logs.cgi',       'Logs',        'activity'],
+        ['blocks.cgi',     'Blocked IPs', 'ban'],
         ['exclusions.cgi', 'Exclusions',  'filter'],
         ['rules.cgi',      'Rules',       'list'],
         ['mode.cgi',       'Protection',  'sliders'],

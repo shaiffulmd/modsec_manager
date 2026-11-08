@@ -38,6 +38,7 @@ my @features = (
     ['wand',     'Exclusion builder',   'Exclude a rule for one site, path or request field, with a config test.'],
     ['sliders',  'Protection tuning',   'SecRuleEngine mode, paranoia level and anomaly thresholds.'],
     ['bell',     'Alerts',              'E-mail or Telegram when blocked requests spike.'],
+    ['ban',      'IP blocking',         'Block attackers at Cloudflare, in ModSecurity and in ufw, with automatic expiry.'],
     ['bot',      'AI bot blocking',     'Block or log GPTBot, ClaudeBot, CCBot and other AI crawlers, per site.'],
     ['cloud',    'Cloudflare readiness', 'Checks real visitor IPs behind Cloudflare and sets up mod_remoteip safely.'],
     ['shield',   'Safe changes',        'Every change is backed up, tested with apachectl and rolled back on failure.'],
@@ -52,6 +53,7 @@ foreach my $f (@features) {
 print "</div></div>\n";
 
 my @releases = (
+    ['0.8.0', 'New Blocked IPs page: block an attacker address at Cloudflare (account-level IP Access Rule), in a ModSecurity blocklist and in ufw, with an end time lifted by cron. Cloudflare, private, server and never-block addresses are refused. Likely attackers on the Logs page get a Block button.'],
     ['0.7.1', 'Cloudflare setup can now move real-IP settings out of VirtualHost blocks (as Virtualmin sites often have) into one setting for every site: the old lines are commented out with a backup, non-Cloudflare trusted proxies are kept, ranges that trust everyone are dropped, and all of it is undone if the config test fails.'],
     ['0.7.0', 'New AI bots page: block or log known AI crawlers (training, AI search and user-triggered fetchers) by User-Agent with a managed ModSecurity rule file, leave chosen sites open, let robots.txt through, and see which bots were caught.'],
     ['0.6.0', 'New Cloudflare page: checks that mod_remoteip logs real visitor addresses (CF-Connecting-IP, trusted Cloudflare ranges, audit log, site DNS) before attacker IPs are sent to Cloudflare, with a one-click real-IP setup that is rolled back if the config test fails.'],

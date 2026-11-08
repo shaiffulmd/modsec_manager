@@ -157,6 +157,7 @@ print "</div>\n";
 my @tiles = (
     ['sites.cgi',             'globe',    'Sites',             'Which websites get flagged most'],
     ['logs.cgi',              'activity', 'Logs',              'Charts, false-positive hints and attackers'],
+    ['blocks.cgi',            'ban',      'Blocked IPs',       'Block attackers at Cloudflare, ModSecurity and ufw'],
     ['exclusion_builder.cgi', 'wand',     'Exclusion builder', 'Exclude a rule for one site, path or field'],
     ['mode.cgi',              'sliders',  'Protection',        'Engine mode, paranoia level and thresholds'],
     ['alerts.cgi',            'bell',     'Alerts',            'E-mail or Telegram when blocks spike'],

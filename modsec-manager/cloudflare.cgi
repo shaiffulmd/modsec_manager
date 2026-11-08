@@ -104,6 +104,8 @@ if ($fix_shown && $mig->{ok}) {
         "</span>, which this module does not manage. Fix it there (Config page or by hand) so two settings do not conflict.");
 }
 
+print "<p class='msm-meta'>Once this server is ready, block attackers and add the Cloudflare API token on the <a href='blocks.cgi'>Blocked IPs</a> page.</p>\n";
+
 # --- Sites --------------------------------------------------------------------
 
 if (@sites) {

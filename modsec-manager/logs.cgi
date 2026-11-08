@@ -233,13 +233,15 @@ if (@txs) {
     print "</div>\n";
     print "<div class='msm-chart'><div class='msm-chart-title'>Likely attackers</div>",
           "<div class='msm-chart-sub'>Scanners, or clients tripping 4+ rules or 20+ requests. Do not exclude these.</div>";
+    my %isblk = map { $_->{ip} => 1 } @{read_blocks()};
     if (@$bad) {
         foreach my $a (@$bad) {
             print "<div class='msm-ins'><div class='msm-ins-main'><a href='", logs_url(ip => $a->{ip}), "'><b>",
                   &html_escape($a->{ip}), "</b></a><div class='msm-ins-sub'>", &html_escape($a->{reason}), "</div></div>",
-                  "<div class='msm-ins-side'><span><b>$a->{events}</b> requests &middot; $a->{blocked} blocked</span></div></div>";
+                  "<div class='msm-ins-side'><span><b>$a->{events}</b> requests &middot; $a->{blocked} blocked</span>",
+                  ($isblk{ip_canonical($a->{ip}) || ''} ? "<a class='msm-badge' href='blocks.cgi'>Blocked</a>" : can_edit() ? "<a class='msm-btn' href='blocks.cgi?ip=" . &url_escape($a->{ip}) . "&amp;reason=" . &url_escape(ucfirst($a->{reason})) . "'>Block</a>" : ""), "</div></div>";
         }
-        print "<p class='msm-meta' style='margin:10px 0 0'>To block an address outright use the firewall (Webmin &gt; Networking) or Cloudflare (see the <a href='cloudflare.cgi'>Cloudflare checks</a>), not ModSecurity exclusions.</p>";
+        print "<p class='msm-meta' style='margin:10px 0 0'>Block an address at Cloudflare, in ModSecurity or in ufw from <a href='blocks.cgi'>Blocked IPs</a>; never with exclusions.</p>";
     } else {
         print "<div class='msm-empty'>None found.</div>";
     }
