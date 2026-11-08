@@ -55,12 +55,12 @@ print field_row("Telegram chat ID",
     "<input name='tg_chat' size='20' value='" . &html_escape($a{tg_chat}) . "' placeholder='-1001234567890'$ro>",
     "Your user, group or channel ID (for example from \@userinfobot).");
 print "</div>\n";
-if (can_edit()) {
-    print "<div class='msm-actions'>", msm_submit("Save settings", 'primary'),
-          msm_submit("Save and send test alert", '', 'test', 1), "</div>";
-}
+# One row of actions: save, test, and preview (preview needs no edit access).
+print "<div class='msm-actions'>";
+print msm_submit("Save settings", 'primary'), msm_submit("Save and send test alert", '', 'test', 1) if (can_edit());
+print "<a class='msm-btn' href='preview_alert.cgi'>", icon('file', 15), "Preview alert e-mail</a>";
+print "</div>\n";
 print "</form>\n";
-print "<p><a class='msm-btn' href='preview_alert.cgi'>", icon('file', 15), "Preview alert e-mail</a></p>\n";
 print "<p class='msm-meta' style='margin-top:14px'>Cron file: <span class='msm-path'>", &html_escape($p{cron_file}), "</span></p>\n";
 
 print_page_end();
