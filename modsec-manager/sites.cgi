@@ -41,7 +41,7 @@ $max = $s{''}{events} if ($s{''} && $s{''}{events} > $max);
 
 print "<div class='msm-legend'><span><span class='msm-sw' style='background:var(--s2)'></span>Blocked</span>",
       "<span><span class='msm-sw' style='background:var(--s1)'></span>Logged only</span></div>\n";
-print "<div class='msm-wrap'><table class='table msm-table'>\n";
+print "<div class='msm-wrap'><table class='msm-table'>\n";
 print "<tr><th>Site</th><th style='min-width:160px'>Flagged requests</th><th>Blocked</th><th>Top rule</th><th>Top path</th><th>Last event</th><th></th></tr>\n";
 
 sub site_row {

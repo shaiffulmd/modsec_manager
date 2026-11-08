@@ -250,7 +250,7 @@ if (@txs) {
 
 if (@rules_fired) {
     print "<div class='msm-h'>Rules that fired</div>\n";
-    print "<div class='msm-wrap'><table class='table msm-table'>\n";
+    print "<div class='msm-wrap'><table class='msm-table'>\n";
     print "<tr><th>Rule</th><th>Hits</th><th>Severity</th><th>Message</th>",
           (can_edit() ? "<th>Exclusion</th>" : ""), "</tr>\n";
     foreach my $h (@rules_fired) {

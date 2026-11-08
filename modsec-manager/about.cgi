@@ -50,6 +50,7 @@ foreach my $f (@features) {
 print "</div></div>\n";
 
 my @releases = (
+    ['0.4.1', 'Interface fixes: table cells keep their spacing under every Webmin theme, card icons are centred, and code snippets use neutral colours.'],
     ['0.4.0', 'Security hardening (escaped errors, form-only changes, secrets kept off the command line), a redesigned interface and this About page.'],
     ['0.3.0', 'Sites page, exclusion builder, false-positive and attacker insights, CRS tuning, e-mail/Telegram alerts and rotated logs.'],
     ['0.2.0', 'Log charts and filters, a new status page, safer file writes, read-only access and a fixed installer.'],
