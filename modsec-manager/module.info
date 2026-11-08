@@ -2,5 +2,5 @@ desc=ModSecurity Manager
 longdesc=Manage Apache ModSecurity on Ubuntu: enforcement mode, OWASP CRS tuning, per-site log insights, scoped exclusions, alerts, config tests and reloads.
 category=servers
 os_support=debian-linux ubuntu-linux
-version=0.7.0
+version=0.7.1
 author=Shaifful

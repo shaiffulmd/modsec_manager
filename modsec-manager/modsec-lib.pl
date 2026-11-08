@@ -1825,14 +1825,80 @@ sub is_managed_realip_file {
     return File::Basename::basename($f) eq cf_realip_conf_name() . ".conf" ? 1 : 0;
 }
 
+# $carry: extra directive lines kept from settings moved out of other files.
 sub cf_realip_conf_text {
-    my ($ranges) = @_;
+    my ($ranges, $carry) = @_;
+    $carry ||= [];
     return "# Real visitor addresses for sites behind Cloudflare.\n" .
            "# Managed by Webmin ModSecurity Manager (Cloudflare page); changes here are overwritten.\n" .
            "<IfModule remoteip_module>\n" .
            "    RemoteIPHeader CF-Connecting-IP\n" .
            join('', map { "    RemoteIPTrustedProxy $_\n" } @$ranges) .
+           (@$carry ? "    # Kept from the settings moved here from other files\n" .
+                      join('', map { "    $_\n" } @$carry) : "") .
            "</IfModule>\n";
+}
+
+# Real-IP settings outside the managed snippet (for example a Cloudflare
+# setup pasted into a Virtualmin VirtualHost) can be moved into it: the old
+# lines are commented out, and any trusted proxy that is not Cloudflare's
+# (such as 127.0.0.1 for a tunnel) is kept. This is only offered when every
+# header there is one Cloudflare sends, so a setup for another proxy is
+# never taken over. Ranges that trust almost everyone are dropped.
+# Returns { ok, reason, edits => [directives], carry => [lines], files => [paths], dropped => [entries] }.
+sub cf_migration_plan {
+    my ($dirs, $cf) = @_;
+    my @foreign = grep { !is_managed_realip_file($_->{file}) } @$dirs;
+    my %plan = (ok => 0, reason => '', edits => [], carry => [], files => [], dropped => []);
+    my @headers = grep { $_->{directive} eq 'remoteipheader' } @foreign;
+    return \%plan if (!@headers);
+    foreach my $h (@headers) {
+        my $name = (split(/\s+/, $h->{args}))[0] || '';
+        next if (lc($name) eq 'cf-connecting-ip' || lc($name) eq 'x-forwarded-for');
+        $plan{reason} = "$h->{file} line $h->{line} sets RemoteIPHeader $name, which Cloudflare does not send, " .
+                        "so it is probably for another proxy. Change that file by hand.";
+        return \%plan;
+    }
+    my %canon = (remoteiptrustedproxy => 'RemoteIPTrustedProxy', remoteipinternalproxy => 'RemoteIPInternalProxy',
+                 remoteiptrustedproxylist => 'RemoteIPTrustedProxyList',
+                 remoteipinternalproxylist => 'RemoteIPInternalProxyList');
+    my (%seen, %files);
+    foreach my $d (@foreign) {
+        push(@{$plan{edits}}, $d);
+        $files{$d->{file}} = 1;
+        next if ($d->{directive} eq 'remoteipheader');
+        my $name = $canon{$d->{directive}};
+        if ($d->{directive} =~ /list$/) {
+            my $l = "$name $d->{args}";
+            push(@{$plan{carry}}, $l) if (!$seen{lc($l)}++);
+            next;
+        }
+        foreach my $i (grep { $_ ne '' } split(/\s+/, $d->{args})) {
+            my $c = cidr_parse($i);
+            next if ($c && grep { cidr_contains($_, $c) } @$cf);
+            if ($c && $c->{len} < (length($c->{net}) == 4 ? 8 : 16)) {
+                push(@{$plan{dropped}}, $i) if (!$seen{"drop $i"}++);
+                next;
+            }
+            my $l = "$name $i";
+            push(@{$plan{carry}}, $l) if (!$seen{lc($l)}++);
+        }
+    }
+    $plan{files} = [ sort keys %files ];
+    $plan{ok} = 1;
+    return \%plan;
+}
+
+# Comment out the given RemoteIP* lines (1-based) of a file, in place. A
+# symlinked file (sites-enabled -> sites-available) is changed at its target.
+sub comment_out_remoteip_lines {
+    my ($file, $lines) = @_;
+    my @l = split(/\n/, read_text_file($file), -1);
+    foreach my $n (@$lines) {
+        next if ($n < 1 || $n > @l || $l[$n - 1] !~ /^\s*RemoteIP/i);
+        $l[$n - 1] =~ s/^(\s*)/$1# Moved to remoteip-cloudflare.conf by Webmin ModSecurity Manager: /;
+    }
+    write_text_file($file, join("\n", @l), 0644);
 }
 
 # Addresses a host name resolves to (IPv4 and IPv6, de-duplicated).
@@ -1898,7 +1964,9 @@ sub cloudflare_readiness {
     my @dir = remoteip_directives();
     my @headers = grep { $_->{directive} eq 'remoteipheader' } @dir;
     my @foreign = grep { !is_managed_realip_file($_->{file}) } @headers;
-    my $can_fix = !@foreign ? 'realip' : '';
+    my $plan = cf_migration_plan(\@dir, \@cf);
+    my $can_fix = !@foreign || $plan->{ok} ? 'realip' : '';
+    $r{migration} = $plan;
     $r{managed} = -e cf_realip_conf_file() ? 1 : 0;
     $r{managed_on} = -e cf_realip_conf_link() ? 1 : 0;
     push(@checks, { id => 'module', title => 'Apache mod_remoteip enabled',
@@ -2048,22 +2116,44 @@ sub cloudflare_readiness {
 
 # Write the managed conf snippet (RemoteIPHeader CF-Connecting-IP and every
 # Cloudflare range as a trusted proxy), enable remoteip and the snippet, and
-# test the config. Everything this changed is undone if the test fails.
+# test the config. Cloudflare real-IP settings found in other files (such as
+# a VirtualHost) are moved into the snippet first. Everything this changed
+# is undone if the test fails.
 # Returns ($ok, \@steps, $message); each step is [title, code, output].
 sub cf_setup_realip {
     my %p = paths();
     my @steps;
-    my @foreign = grep { $_->{directive} eq 'remoteipheader' && !is_managed_realip_file($_->{file}) } remoteip_directives();
-    if (@foreign) {
-        return (0, [], "A RemoteIPHeader is already set in $foreign[0]{file} line $foreign[0]{line}. " .
-                       "Change that file by hand so two settings do not conflict.");
-    }
     my ($ranges, $src, $err) = cf_ip_ranges(1);
+    my @cf = grep { $_ } map { cidr_parse($_) } @$ranges;
+    my @dirs = remoteip_directives();
+    my @foreign = grep { $_->{directive} eq 'remoteipheader' && !is_managed_realip_file($_->{file}) } @dirs;
+    my $plan = cf_migration_plan(\@dirs, \@cf);
+    return (0, [], $plan->{reason} || "A RemoteIPHeader is already set in another file.") if (@foreign && !$plan->{ok});
     my $file = cf_realip_conf_file();
     -d File::Basename::dirname($file) || return (0, [], "Directory not found: " . File::Basename::dirname($file));
+
+    # Move settings out of other files: back each file up, then comment out.
+    my @moved;   # [real path, backup]
+    if ($plan->{ok}) {
+        my %by;
+        push(@{$by{$_->{file}}}, $_) foreach (@{$plan->{edits}});
+        foreach my $f (sort keys %by) {
+            my $real = Cwd::abs_path($f) || $f;
+            my $bk = backup_file($real);
+            push(@moved, [$real, $bk]);
+            comment_out_remoteip_lines($real, [ map { $_->{line} } @{$by{$f}} ]);
+            push(@steps, ["Commented out " . plural(scalar(@{$by{$f}}), 'line') . " in $f", 0,
+                          join('', map { "line $_->{line}: $_->{args}\n" } @{$by{$f}}) . "Backup: $bk\n"]);
+        }
+        push(@steps, ["Kept " . plural(scalar(@{$plan->{carry}}), 'other trusted proxy setting'), 0,
+                      join("\n", @{$plan->{carry}}) . "\n"]) if (@{$plan->{carry}});
+        push(@steps, ["Dropped ranges that trusted almost every address", 0, join("\n", @{$plan->{dropped}}) . "\n"])
+            if (@{$plan->{dropped}});
+    }
+
     my $existed = -e $file;
     my $backup = $existed ? backup_file($file) : undef;
-    write_text_file($file, cf_realip_conf_text($ranges), 0644);
+    write_text_file($file, cf_realip_conf_text($ranges, $plan->{ok} ? $plan->{carry} : []), 0644);
     push(@steps, ["Wrote $file (" . scalar(@$ranges) . " Cloudflare ranges, $src list)", 0,
                   $err ? "Live list not available ($err); used the $src list.\n" : '']);
 
@@ -2088,10 +2178,14 @@ sub cf_setup_realip {
             if ($conf_added);
         push(@steps, ['Rollback: a2dismod remoteip', run_command_list($p{a2dismod}, 'remoteip')]) if ($mod_added);
         $existed ? restore_backup($file, $backup) : remove_created_file($file);
+        restore_backup(@$_) foreach (@moved);
+        push(@steps, ["Rollback: restored " . plural(scalar(@moved), 'file') . " the settings were moved from", 0, ''])
+            if (@moved);
         return (0, \@steps, "Setup failed and every change was undone. See the output below.");
     }
-    return (1, \@steps, "Real visitor addresses are configured. Reload Apache to apply, then wait for new requests " .
-                        "before checking the audit log again.");
+    return (1, \@steps, "Real visitor addresses are configured for every site" .
+                        (@moved ? ", and the old settings in " . plural(scalar(@moved), 'file') . " were commented out" : "") .
+                        ". Reload Apache to apply, then wait for new requests before checking the audit log again.");
 }
 
 # ---------------------------------------------------------------------------

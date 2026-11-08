@@ -40,6 +40,9 @@ Webmin module for managing Apache + ModSecurity on Ubuntu 24.04 or newer servers
   - which sites resolve to Cloudflare (proxied) and which go straight to the server
   - one-click setup writes `conf-available/remoteip-cloudflare.conf`, enables it with
     `a2enmod remoteip` and `a2enconf`, and rolls back if the config test fails
+  - Cloudflare real-IP settings already in other files (such as a VirtualHost) are moved
+    into that file: the old lines are commented out with a backup, other trusted proxies
+    are kept, and a header for a different proxy is never taken over
 - Edit `modsecurity.conf`, `security2.conf` and the custom exclusions file
 - List, edit, enable and disable rule files (including the CRS `rules/` directory)
 - Every change is backed up (last 10 kept), checked with `apachectl configtest`,

@@ -52,6 +52,7 @@ foreach my $f (@features) {
 print "</div></div>\n";
 
 my @releases = (
+    ['0.7.1', 'Cloudflare setup can now move real-IP settings out of VirtualHost blocks (as Virtualmin sites often have) into one setting for every site: the old lines are commented out with a backup, non-Cloudflare trusted proxies are kept, ranges that trust everyone are dropped, and all of it is undone if the config test fails.'],
     ['0.7.0', 'New AI bots page: block or log known AI crawlers (training, AI search and user-triggered fetchers) by User-Agent with a managed ModSecurity rule file, leave chosen sites open, let robots.txt through, and see which bots were caught.'],
     ['0.6.0', 'New Cloudflare page: checks that mod_remoteip logs real visitor addresses (CF-Connecting-IP, trusted Cloudflare ranges, audit log, site DNS) before attacker IPs are sent to Cloudflare, with a one-click real-IP setup that is rolled back if the config test fails.'],
     ['0.5.2', 'Redesigned Sites page: summary cards, site search, card rows for active sites with alias chips, and quiet sites folded away. Table spacing now holds against themes that force cell padding.'],

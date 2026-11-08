@@ -61,7 +61,9 @@ print_readonly_notice();
 
 # --- Requirements -------------------------------------------------------------
 
-my $fix_label = $r{managed} ? 'Update real-IP settings' : 'Set up real visitor IPs';
+my $mig = $r{migration};
+my $fix_label = $mig->{ok} ? 'Move and set up real visitor IPs'
+              : $r{managed} ? 'Update real-IP settings' : 'Set up real visitor IPs';
 my $fix_shown = 0;
 print "<div class='msm-panel'><div class='msm-panel-title'>Requirements</div><div class='msm-panel-sub'>",
       "Red items must be fixed before attacker IPs are sent to Cloudflare.</div>\n";
@@ -77,13 +79,28 @@ foreach my $c (@checks) {
 }
 print "</div>\n";
 
-if ($fix_shown) {
+if ($fix_shown && $mig->{ok}) {
+    my %by;
+    push(@{$by{$_->{file}}}, $_->{line}) foreach (@{$mig->{edits}});
+    print callout('info', "Real-IP settings were found in files this module does not manage. <b>$fix_label</b> moves them " .
+        "into one setting for every site:<ul style='margin:6px 0'>" .
+        join('', map { "<li><span class='msm-path'>" . &html_escape($_) . "</span>, lines " .
+                       &html_escape(join(', ', @{$by{$_}})) . " are commented out (a backup is kept)</li>" } sort keys %by) .
+        "<li><span class='msm-path'>" . &html_escape(cf_realip_conf_file()) . "</span> gets <code>RemoteIPHeader " .
+        "CF-Connecting-IP</code> and all " . scalar(@{$r{ranges}}) . " Cloudflare ranges" .
+        (@{$mig->{carry}} ? ", plus the other trusted proxies found there: <code>" .
+            &html_escape(join(', ', map { (split(/\s+/, $_, 2))[1] } @{$mig->{carry}})) . "</code>" : "") . "</li>" .
+        (@{$mig->{dropped}} ? "<li>Dropped because they trust almost every address: <code>" .
+            &html_escape(join(', ', @{$mig->{dropped}})) . "</code></li>" : "") .
+        "</ul>Then <code>remoteip</code> and the snippet are enabled and the config is tested. Everything is undone if the test fails.");
+} elsif ($fix_shown) {
     print callout('info', "<b>$fix_label</b> writes <span class='msm-path'>" . &html_escape(cf_realip_conf_file()) .
         "</span> with <code>RemoteIPHeader CF-Connecting-IP</code> and every Cloudflare range as a trusted proxy, " .
         "enables <code>remoteip</code> and the snippet, and runs a config test. Everything is undone if the test fails.");
 } elsif (@{$r{foreign_headers}} && grep { $_->{state} ne 'ok' && $_->{id} =~ /^(?:header|trusted)$/ } @checks) {
     my $f = $r{foreign_headers}[0];
-    print callout('warn', "The real-IP settings come from <span class='msm-path'>" . &html_escape("$f->{file}:$f->{line}") .
+    print callout('warn', $mig->{reason} ? &html_escape($mig->{reason}) :
+        "The real-IP settings come from <span class='msm-path'>" . &html_escape("$f->{file}:$f->{line}") .
         "</span>, which this module does not manage. Fix it there (Config page or by hand) so two settings do not conflict.");
 }
 
