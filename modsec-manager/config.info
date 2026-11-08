@@ -21,3 +21,4 @@ dpkg_query=dpkg-query command,0
 line4=Alerts (set on the Alerts page),11
 cron_file=Cron file for alert checks,0
 alert_from=Alert e-mail sender address,3,Default (webmin@hostname)
+alert_webmin_url=Webmin address used in alert links,3,Automatic

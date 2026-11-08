@@ -25,6 +25,8 @@ Webmin module for managing Apache + ModSecurity on Ubuntu 24.04 or newer servers
   anomaly thresholds (CRS 3 and 4)
 - **Alerts**: e-mail and/or Telegram when blocked requests in an interval reach a
   threshold, checked by a cron job in `/etc/cron.d/webmin-modsec-manager`
+  - HTML e-mail with a plain-text fallback, sent through the local `sendmail`; preview it
+    from the Alerts page without sending
 - Edit `modsecurity.conf`, `security2.conf` and the custom exclusions file
 - List, edit, enable and disable rule files (including the CRS `rules/` directory)
 - Every change is backed up (last 10 kept), checked with `apachectl configtest`,

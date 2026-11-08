@@ -50,6 +50,7 @@ foreach my $f (@features) {
 print "</div></div>\n";
 
 my @releases = (
+    ['0.5.0', 'Professional HTML alert e-mails with a plain-text fallback, an e-mail preview on the Alerts page, and a setting for the Webmin address used in alert links.'],
     ['0.4.1', 'Interface fixes: table cells keep their spacing under every Webmin theme, card icons are centred, and code snippets use neutral colours.'],
     ['0.4.0', 'Security hardening (escaped errors, form-only changes, secrets kept off the command line), a redesigned interface and this About page.'],
     ['0.3.0', 'Sites page, exclusion builder, false-positive and attacker insights, CRS tuning, e-mail/Telegram alerts and rotated logs.'],

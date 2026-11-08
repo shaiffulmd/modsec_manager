@@ -1322,62 +1322,270 @@ sub recent_blocked {
     return (\@b, $since);
 }
 
-sub alert_message {
-    my ($txs, $minutes) = @_;
-    my $host = &get_system_hostname();
-    my $n = scalar(@$txs);
-    my $subject = "[ModSecurity] $n blocked requests in the last $minutes minutes on $host";
+# Link to this module in Webmin for alert messages: the alert_webmin_url
+# setting, else Webmin's own idea of its URL, else https://host:port/.
+sub webmin_module_url {
+    my $u = cfg('alert_webmin_url', '');
+    $u =~ s/\s+//g;
+    if ($u !~ m#^https?://[^\s"'<>]+$#) {
+        $u = '';
+        if (defined(&get_webmin_browser_url)) {
+            $u = eval { &get_webmin_browser_url($module_name) } || '';
+        }
+        if (!$u) {
+            my %mini;
+            eval { &get_miniserv_config(\%mini) } if (defined(&get_miniserv_config));
+            my $port = $mini{'port'} || 10000;
+            my $proto = (!%mini || $mini{'ssl'}) ? 'https' : 'http';
+            $u = "$proto://" . &get_system_hostname() . ":$port/" . ($module_name || 'modsec-manager') . "/";
+        }
+    }
+    $u .= '/' if ($u !~ m#/$#);
+    return $u;
+}
+
+# "1 request", "5 requests".
+sub plural {
+    my ($n, $word) = @_;
+    return "$n $word" . ($n == 1 ? "" : "s");
+}
+
+# Everything an alert says, gathered once for the text and HTML versions.
+sub alert_report {
+    my ($txs, $minutes, $test) = @_;
+    my %a = alert_settings();
+    my %m = module_meta();
     my @vh = apache_vhosts();
-    my $top = sub {
-        my ($title, $get) = @_;
-        my @rows = top_values($txs, $get, 5);
-        return '' if (!@rows);
-        return "$title:\n" . join('', map { sprintf("  %5d  %s\n", $_->[1], $_->[0]) } @rows) . "\n";
+    my %msg;
+    foreach my $tx (@$txs) {
+        foreach my $mm (@{$tx->{messages}}) {
+            $msg{$mm->{id}} ||= $mm->{msg} if ($mm->{id});
+        }
+    }
+    my %clients = map { ($_->{client} || '') => 1 } @$txs;
+    delete $clients{''};
+    my @l = localtime(time());
+    my @mn = qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+    my @rules = grep { !is_score_rule($_->[0]) } top_values($txs, \&tx_rule_ids);
+    my %r = (
+        host      => &get_system_hostname(),
+        n         => scalar(@$txs),
+        minutes   => $minutes,
+        threshold => $a{threshold},
+        cooldown  => $a{cooldown},
+        test      => $test ? 1 : 0,
+        version   => $m{version},
+        time      => sprintf("%d %s %d, %02d:%02d", $l[3], $mn[$l[4]], $l[5] + 1900, $l[2], $l[1]),
+        url       => webmin_module_url(),
+        clients   => scalar(keys %clients),
+        rules_n   => scalar(@rules),
+        sites     => [ top_values($txs, sub { site_for_host($_[0]{host}, \@vh) || norm_host($_[0]{host}) || '(no host)' }, 5) ],
+        ips       => [ top_values($txs, sub { $_[0]{client} }, 5) ],
+        rules     => [ map { [ $_->[0], $_->[1], $msg{$_->[0]} || '' ] } (@rules > 5 ? @rules[0 .. 4] : @rules) ],
+        paths     => [ top_values($txs, \&tx_path, 5) ],
+    );
+    $r{sites_n} = scalar(top_values($txs, sub { site_for_host($_[0]{host}, \@vh) || norm_host($_[0]{host}) }));
+    return \%r;
+}
+
+sub alert_text {
+    my ($r) = @_;
+    my $line = ('-' x 56) . "\n";
+    my $t = ($r->{test} ? "TEST ALERT - no action needed\n\n" : "") .
+            "ModSecurity blocked " . plural($r->{n}, "request") . " in the last $r->{minutes} minutes\n" .
+            "Server: $r->{host}\nTime:   $r->{time}\nAlert threshold: $r->{threshold} per $r->{minutes} minutes\n\n" .
+            sprintf("%-14s %d\n%-14s %d\n%-14s %d\n", 'Sites hit:', $r->{sites_n}, 'Clients:', $r->{clients},
+                    'Rules:', $r->{rules_n});
+    my $sec = sub {
+        my ($title, $rows, $fmt) = @_;
+        return '' if (!@$rows);
+        return "\n$title\n$line" . join('', map { $fmt->($_) } @$rows);
     };
-    my $body = "$n requests were blocked by ModSecurity on $host in the last $minutes minutes.\n\n".
-        $top->('Sites', sub { site_for_host($_[0]{host}, \@vh) || norm_host($_[0]{host}) }).
-        $top->('Clients', sub { $_[0]{client} }).
-        $top->('Rules', sub { grep { !is_score_rule($_) } tx_rule_ids($_[0]) }).
-        $top->('Paths', \&tx_path).
-        "Open Webmin > Servers > ModSecurity Manager > Logs for details.\n";
-    return ($subject, $body);
+    $t .= $sec->('TOP SITES', $r->{sites}, sub { sprintf("%6d  %s\n", $_[0][1], $_[0][0]) });
+    $t .= $sec->('TOP CLIENTS', $r->{ips}, sub { sprintf("%6d  %s\n", $_[0][1], $_[0][0]) });
+    $t .= $sec->('TOP RULES', $r->{rules}, sub { sprintf("%6d  %s  %s\n", $_[0][1], $_[0][0], substr($_[0][2], 0, 60)) });
+    $t .= $sec->('TOP PATHS', $r->{paths}, sub { sprintf("%6d  %s\n", $_[0][1], $_[0][0]) });
+    $t .= "\nOpen the logs: $r->{url}logs.cgi?blocked=1\n" .
+          "\n--\nModSecurity Manager $r->{version} on $r->{host}\n" .
+          "At most one alert is sent every $r->{cooldown} minutes. Change this under Alerts in the module.\n";
+    return $t;
+}
+
+# Email-safe HTML: table layout, inline styles, no images or scripts.
+# Every value from the log is escaped.
+sub alert_html {
+    my ($r) = @_;
+    my $e = sub { &html_escape(defined($_[0]) ? $_[0] : '') };
+    my $font = "font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif";
+    my $mono = "font-family:SFMono-Regular,Menlo,Consolas,Liberation Mono,monospace";
+    my $stat = sub {
+        my ($label, $value) = @_;
+        return "<td width='25%' align='center' style='padding:14px 6px;border-right:1px solid #eef0f4'>" .
+               "<div style='$font;font-size:22px;font-weight:700;color:#111827;line-height:1.2'>" . $e->($value) . "</div>" .
+               "<div style='$font;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#6b7280;margin-top:4px'>" .
+               $e->($label) . "</div></td>";
+    };
+    my $section = sub {
+        my ($title, $rows, $mono_label, $sub) = @_;
+        return '' if (!@$rows);
+        my $max = $rows->[0][1] || 1;
+        my $h = "<tr><td style='padding:22px 32px 0'>" .
+                "<div style='$font;font-size:12px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:#6b7280;margin:0 0 8px'>" .
+                $e->($title) . "</div><table role='presentation' width='100%' cellpadding='0' cellspacing='0' style='border-collapse:collapse'>";
+        foreach my $row (@$rows) {
+            my $w = int(100 * $row->[1] / $max + 0.5);
+            $w = 3 if ($w < 3);
+            $h .= "<tr><td style='padding:7px 0;border-top:1px solid #eef0f4;$font;font-size:13px;color:#111827'>" .
+                  "<div style='" . ($mono_label ? "$mono;font-size:12.5px;" : "") . "word-break:break-all'>" . $e->($row->[0]) .
+                  ($sub && $sub->($row) ne '' ? "<span style='$font;font-size:12px;color:#6b7280'> &middot; " . $e->($sub->($row)) . "</span>" : "") .
+                  "</div><div style='background:#eef2fb;border-radius:4px;height:6px;margin-top:5px'>" .
+                  "<div style='width:$w%;background:#2f6fed;height:6px;border-radius:4px'></div></div></td>" .
+                  "<td width='56' align='right' valign='top' style='padding:7px 0 7px 12px;border-top:1px solid #eef0f4;$font;font-size:13px;font-weight:600;color:#111827'>" .
+                  $e->($row->[1]) . "</td></tr>";
+        }
+        return $h . "</table></td></tr>";
+    };
+    my $pre = $r->{test} ? "Test alert from ModSecurity Manager on $r->{host}"
+                         : plural($r->{n}, "blocked request") . " in $r->{minutes} minutes on $r->{host}";
+    my $html = "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>" .
+        "<meta name='color-scheme' content='light only'><title>" . $e->("ModSecurity alert") . "</title></head>" .
+        "<body style='margin:0;padding:0;background:#f3f5f9'>" .
+        "<div style='display:none;max-height:0;overflow:hidden;opacity:0'>" . $e->($pre) . "</div>" .
+        "<table role='presentation' width='100%' cellpadding='0' cellspacing='0' style='background:#f3f5f9'><tr><td align='center' style='padding:28px 12px'>" .
+        "<table role='presentation' width='600' cellpadding='0' cellspacing='0' style='width:100%;max-width:600px;background:#ffffff;border-radius:14px;overflow:hidden;border:1px solid #e5e8ef'>";
+
+    # Header
+    $html .= "<tr><td style='background:#1d4ed8;background-image:linear-gradient(135deg,#3b82f6,#1d4ed8);padding:22px 32px'>" .
+        "<table role='presentation' width='100%' cellpadding='0' cellspacing='0'><tr>" .
+        "<td width='44' valign='middle'><div style='width:40px;height:40px;border-radius:11px;background:rgba(255,255,255,.18);" .
+        "text-align:center;line-height:40px;font-size:20px;color:#ffffff'>&#128737;</div></td>" .
+        "<td valign='middle' style='padding-left:12px'><div style='$font;font-size:16px;font-weight:700;color:#ffffff'>ModSecurity Manager</div>" .
+        "<div style='$font;font-size:12.5px;color:#dbe6ff'>" . $e->($r->{host}) . "</div></td>" .
+        "<td align='right' valign='middle'><span style='display:inline-block;$font;font-size:11.5px;font-weight:700;letter-spacing:.04em;" .
+        "color:#ffffff;background:" . ($r->{test} ? "rgba(255,255,255,.22)" : "#d64545") . ";border-radius:999px;padding:5px 11px'>" .
+        ($r->{test} ? "TEST" : "ALERT") . "</span></td></tr></table></td></tr>";
+
+    # Headline
+    $html .= "<tr><td style='padding:28px 32px 8px'>" .
+        ($r->{test} ? "<div style='$font;font-size:13px;color:#1d4ed8;background:#eef2ff;border-radius:8px;padding:9px 12px;margin:0 0 16px'>" .
+                      "This is a test message. Your alert settings work; no action is needed.</div>" : "") .
+        "<div style='$font;font-size:13px;font-weight:600;color:#d64545;letter-spacing:.02em'>Spike in blocked requests</div>" .
+        "<div style='$font;font-size:26px;font-weight:700;color:#111827;line-height:1.25;margin-top:4px'>" .
+        $e->(plural($r->{n}, "request")) . " blocked in " . $e->($r->{minutes}) . " minutes</div>" .
+        "<div style='$font;font-size:14px;color:#4b5563;margin-top:8px;line-height:1.5'>ModSecurity on <b>" . $e->($r->{host}) .
+        "</b> blocked more requests than your alert threshold of <b>" . $e->($r->{threshold}) . "</b> per " .
+        $e->($r->{minutes}) . " minutes. Reported " . $e->($r->{time}) . ".</div></td></tr>";
+
+    # Stats
+    $html .= "<tr><td style='padding:16px 32px 4px'><table role='presentation' width='100%' cellpadding='0' cellspacing='0' " .
+        "style='border:1px solid #eef0f4;border-radius:10px;border-collapse:separate'><tr>" .
+        $stat->('Blocked', $r->{n}) . $stat->('Sites', $r->{sites_n}) . $stat->('Clients', $r->{clients}) .
+        "<td width='25%' align='center' style='padding:14px 6px'><div style='$font;font-size:22px;font-weight:700;color:#111827;line-height:1.2'>" .
+        $e->($r->{rules_n}) . "</div><div style='$font;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#6b7280;margin-top:4px'>Rules</div></td>" .
+        "</tr></table></td></tr>";
+
+    # Breakdown
+    $html .= $section->('Top sites', $r->{sites}, 0);
+    $html .= $section->('Top clients', $r->{ips}, 1);
+    $html .= $section->('Top rules', $r->{rules}, 0, sub { $_[0][2] });
+    $html .= $section->('Top paths', $r->{paths}, 1);
+
+    # Call to action
+    $html .= "<tr><td style='padding:26px 32px 30px'>" .
+        "<table role='presentation' cellpadding='0' cellspacing='0'><tr><td style='border-radius:9px;background:#2f6fed'>" .
+        "<a href='" . $e->("$r->{url}logs.cgi?blocked=1") . "' style='display:inline-block;padding:12px 20px;$font;font-size:14px;" .
+        "font-weight:600;color:#ffffff;text-decoration:none;border-radius:9px'>Review blocked requests &rarr;</a></td></tr></table>" .
+        "<div style='$font;font-size:12.5px;color:#6b7280;margin-top:12px;line-height:1.5'>If these are real users, " .
+        "use <b>Possible false positives</b> on the Logs page to build a scoped exclusion. " .
+        "If they come from a few clients, block them in the firewall.</div></td></tr>";
+
+    # Footer
+    $html .= "<tr><td style='background:#f8f9fc;border-top:1px solid #eef0f4;padding:16px 32px'>" .
+        "<div style='$font;font-size:12px;color:#6b7280;line-height:1.55'>Sent by ModSecurity Manager " . $e->($r->{version}) .
+        " on " . $e->($r->{host}) . ". At most one alert is sent every " . $e->($r->{cooldown}) .
+        " minutes.<br>Change these alerts in Webmin &rsaquo; Servers &rsaquo; ModSecurity Manager &rsaquo; Alerts.</div></td></tr>";
+    $html .= "</table></td></tr></table></body></html>\n";
+    return $html;
+}
+
+# Returns ($subject, $text, $html).
+sub alert_message {
+    my ($txs, $minutes, $test) = @_;
+    my $r = alert_report($txs, $minutes, $test);
+    my $subject = ($test ? "[TEST] " : "") . "ModSecurity: " . plural($r->{n}, "blocked request") . " in $minutes min on $r->{host}";
+    return ($subject, alert_text($r), alert_html($r));
+}
+
+# A multipart/alternative message (plain text + HTML), UTF-8.
+sub build_mime_message {
+    my ($from, $to, $subject, $text, $html) = @_;
+    require MIME::Base64;
+    require MIME::QuotedPrint;
+    foreach my $v (\$from, \$to, \$subject) { $$v =~ s/[\r\n]+/ /g; }
+    foreach my $v (\$text, \$html) { utf8::encode($$v) if (utf8::is_utf8($$v)); }
+    my @d = qw(Sun Mon Tue Wed Thu Fri Sat);
+    my @mn = qw(Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec);
+    my @l = localtime(time());
+    my $date = sprintf("%s, %02d %s %04d %02d:%02d:%02d %s", $d[$l[6]], $l[3], $mn[$l[4]], $l[5] + 1900,
+                       $l[2], $l[1], $l[0], POSIX::strftime("%z", @l));
+    my $host = &get_system_hostname();
+    my $b = "=_msm_" . time() . "_" . $$ . "_" . int(rand(1e9));
+    return "From: $from\nTo: $to\nSubject: $subject\nDate: $date\n" .
+           "Message-ID: <msm." . time() . ".$$\@$host>\nMIME-Version: 1.0\n" .
+           "Auto-Submitted: auto-generated\nX-Mailer: ModSecurity Manager\n" .
+           "Content-Type: multipart/alternative; boundary=\"$b\"\n\n" .
+           "This is a multi-part message in MIME format.\n\n" .
+           "--$b\nContent-Type: text/plain; charset=UTF-8\nContent-Transfer-Encoding: quoted-printable\n\n" .
+           MIME::QuotedPrint::encode_qp($text) . "\n" .
+           "--$b\nContent-Type: text/html; charset=UTF-8\nContent-Transfer-Encoding: base64\n\n" .
+           MIME::Base64::encode_base64($html) .
+           "--$b--\n";
 }
 
 # Send to every configured channel. Returns list of [channel, ok, message].
+# E-mail goes out as HTML + text through the local sendmail; without one it
+# falls back to Webmin's mail module with the text version.
 sub send_alert {
-    my ($subject, $body) = @_;
+    my ($subject, $text, $html) = @_;
     my %a = alert_settings();
     my @res;
     if ($a{email}) {
-        my $from = cfg('alert_from', 'webmin@' . &get_system_hostname());
+        my $addr = cfg('alert_from', 'webmin@' . &get_system_hostname());
+        $addr =~ s/[\r\n<>"]+//g;
+        my $from = "\"ModSecurity Manager\" <$addr>";
+        my $how = '';
         my $ok = eval {
-            if (&foreign_check("mailboxes")) {
+            if (-x '/usr/sbin/sendmail' && $html) {
+                open(my $mh, '|-', '/usr/sbin/sendmail', '-t', '-oi', '-f', $addr) || die "cannot run sendmail: $!\n";
+                print $mh build_mime_message($from, $a{email}, $subject, $text, $html);
+                close($mh) || die "sendmail exited with an error\n";
+                $how = 'HTML';
+            } elsif (&foreign_check("mailboxes")) {
                 &foreign_require("mailboxes", "mailboxes-lib.pl");
-                &mailboxes::send_text_mail($from, $a{email}, undef, $subject, $body);
+                &mailboxes::send_text_mail($addr, $a{email}, undef, $subject, $text);
+                $how = 'plain text';
             } else {
-                my $sm = -x '/usr/sbin/sendmail' ? '/usr/sbin/sendmail' : die "sendmail not found\n";
-                open(my $mh, '|-', $sm, '-t', '-oi') || die "cannot run sendmail: $!\n";
-                print $mh "From: $from\nTo: $a{email}\nSubject: $subject\n\n$body";
-                close($mh) || die "sendmail failed\n";
+                die "no sendmail and no Webmin mail module\n";
             }
             1;
         };
-        push(@res, ['email', $ok ? 1 : 0, $ok ? "Sent to $a{email}" : "Failed: $@"]);
+        push(@res, ['email', $ok ? 1 : 0, $ok ? "Sent to $a{email} ($how)" : "Failed: $@"]);
     }
     if ($a{tg_token} && $a{tg_chat}) {
         my $url = "https://api.telegram.org/bot$a{tg_token}/sendMessage";
-        my $text = "$subject\n\n$body";
-        $text = substr($text, 0, 4000) if (length($text) > 4000);
+        my $msg_text = "$subject\n\n$text";
+        $msg_text = substr($msg_text, 0, 4000) if (length($msg_text) > 4000);
         my ($ok, $msg);
         require HTTP::Tiny;
         if (HTTP::Tiny->can_ssl()) {
-            my $r = HTTP::Tiny->new(timeout => 15)->post_form($url, { chat_id => $a{tg_chat}, text => $text });
+            my $r = HTTP::Tiny->new(timeout => 15)->post_form($url, { chat_id => $a{tg_chat}, text => $msg_text,
+                                                                       disable_web_page_preview => 'true' });
             ($ok, $msg) = ($r->{success}, $r->{success} ? "Sent to chat $a{tg_chat}" : "HTTP $r->{status}: $r->{content}");
         } elsif (-x '/usr/bin/curl') {
             (my $q = $url) =~ s/(["\\])/\\$1/g;
             my ($code, $out) = run_command_list({ _stdin => "url = \"$q\"\n" }, '/usr/bin/curl', '-sS', '-m', '15',
-                '--fail-with-body', '-K', '-',
-                '--data-urlencode', "chat_id=$a{tg_chat}", '--data-urlencode', "text=$text");
+                '--fail-with-body', '-K', '-', '--data-urlencode', "chat_id=$a{tg_chat}",
+                '--data-urlencode', "disable_web_page_preview=true", '--data-urlencode', "text=$msg_text");
             ($ok, $msg) = ($code == 0, $code == 0 ? "Sent to chat $a{tg_chat}" : "curl failed: $out");
         } else {
             ($ok, $msg) = (0, "No HTTPS client available (install libio-socket-ssl-perl or curl)");
@@ -1758,6 +1966,18 @@ sub callout {
     my ($kind, $html, $action) = @_;
     my $cls = $kind && $kind ne 'warn' ? " msm-alert-$kind" : '';
     return "<div class='msm-alert$cls'><div class='msm-alert-text'>$html</div>" . ($action || '') . "</div>\n";
+}
+
+# Shows an alert e-mail as the recipient sees it. The HTML is rendered in a
+# sandboxed iframe (no scripts, no same-origin access).
+sub print_email_preview {
+    my ($subject, $text, $html) = @_;
+    print "<div class='msm-panel'><div class='msm-panel-head'><div><div class='msm-panel-title'>E-mail preview</div>",
+          "<div class='msm-panel-sub'>Subject: <b>", &html_escape($subject), "</b></div></div></div>\n";
+    print "<iframe title='Alert e-mail preview' sandbox='' srcdoc='", &html_escape($html),
+          "' style='width:100%;height:880px;border:1px solid var(--line);border-radius:10px;background:#f3f5f9'></iframe>\n";
+    print "<details><summary>Plain-text version (also used for Telegram)</summary><pre style='white-space:pre-wrap'>",
+          &html_escape($text), "</pre></details></div>\n";
 }
 
 # Log window selector: current log only, or include rotated copies.

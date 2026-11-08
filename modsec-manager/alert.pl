@@ -27,8 +27,8 @@ if (open(my $fh, '<', $state)) {
 }
 exit(0) if ($last =~ /^\d+$/ && time() - $last < $a{cooldown} * 60);
 
-my ($subject, $body) = alert_message($recent, $a{interval});
-my @res = send_alert($subject, $body);
+my ($subject, $text, $html) = alert_message($recent, $a{interval});
+my @res = send_alert($subject, $text, $html);
 if (grep { $_->[1] } @res) {
     write_text_file($state, time() . "\n", 0600);
 }

@@ -47,15 +47,14 @@ if (!$in{'test'}) {
 &ui_print_header(undef, "Alerts", "");
 print_nav('alerts.cgi');
 my ($recent) = recent_blocked($a{interval});
-my ($subject, $body) = alert_message($recent, $a{interval});
-my @res = send_alert("[TEST] $subject", $body);
+my ($subject, $text, $html) = alert_message($recent, $a{interval}, 1);
+my @res = send_alert($subject, $text, $html);
 if (!@res) {
-    print "<div class='msm-alert'><div class='msm-alert-text'>Settings saved, but no e-mail address or ",
-          "Telegram bot is configured, so nothing was sent.</div></div>\n";
+    print callout('warn', "Settings saved, but no e-mail address or Telegram bot is configured, so nothing was sent.");
 }
 foreach my $r (@res) {
     print_command_result("Test via $r->[0]", $r->[1] ? 0 : 1, $r->[2]);
 }
-print "<div class='msm-h'>Message</div><pre>", &html_escape("$subject\n\n$body"), "</pre>\n";
+print_email_preview($subject, $text, $html);
 print_page_end();
 &ui_print_footer("alerts.cgi", "alerts", "", $text{'index_return'});

@@ -60,6 +60,7 @@ if (can_edit()) {
           msm_submit("Save and send test alert", '', 'test', 1), "</div>";
 }
 print "</form>\n";
+print "<p><a class='msm-btn' href='preview_alert.cgi'>", icon('file', 15), "Preview alert e-mail</a></p>\n";
 print "<p class='msm-meta' style='margin-top:14px'>Cron file: <span class='msm-path'>", &html_escape($p{cron_file}), "</span></p>\n";
 
 print_page_end();
