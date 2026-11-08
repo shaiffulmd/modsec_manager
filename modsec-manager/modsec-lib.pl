@@ -798,7 +798,7 @@ sub tx_path {
     $uri =~ s/^[A-Z]+\s+//;
     $uri =~ s/\s+HTTP\/\S+$//;
     $uri =~ s/\?.*$//;
-    return $uri;
+    return $uri eq '-' ? '' : $uri;
 }
 
 # Epoch seconds from the time formats ModSecurity and Apache write:
@@ -1787,18 +1787,42 @@ font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",
 /* tables */
 .msm-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow);margin:0 0 14px}
 table.msm-table{width:100%;border-collapse:collapse;margin:0}
-.msm table.msm-table th,.msm table.msm-table>tbody>tr>th,.msm table.msm-table>thead>tr>th{text-align:left;font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;opacity:.75;font-weight:650;padding:10px 14px;background:var(--soft);border-bottom:1px solid var(--line);white-space:nowrap}
-.msm table.msm-table td,.msm table.msm-table>tbody>tr>td{padding:11px 14px;border-top:1px solid var(--line);vertical-align:top;overflow-wrap:break-word;word-break:normal}
+.msm table.msm-table th,.msm table.msm-table>tbody>tr>th,.msm table.msm-table>thead>tr>th{text-align:left;font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;opacity:.75;font-weight:650;padding:10px 14px!important;background:var(--soft);border-bottom:1px solid var(--line);white-space:nowrap}
+.msm table.msm-table td,.msm table.msm-table>tbody>tr>td{padding:11px 14px!important;border-top:1px solid var(--line);vertical-align:top!important;overflow-wrap:break-word;word-break:normal}
 .msm table.msm-table tr:first-child td,.msm table.msm-table>tbody>tr:first-child>td{border-top:0}
 .msm table.msm-table tr:hover td,.msm table.msm-table>tbody>tr:hover>td{background:var(--soft)}
 table.msm-table td .msm-path{overflow-wrap:anywhere}
 table.msm-kv{width:100%;border-collapse:collapse}
-.msm table.msm-kv td,.msm table.msm-kv>tbody>tr>td{padding:9px 10px;border-top:1px solid var(--line);vertical-align:top}
+.msm table.msm-kv td,.msm table.msm-kv>tbody>tr>td{padding:9px 10px!important;border-top:1px solid var(--line);vertical-align:top!important}
 .msm table.msm-kv tr:first-child td,.msm table.msm-kv>tbody>tr:first-child>td{border-top:0}
 .msm table.msm-kv td.msm-k{width:40%;opacity:.72}
 .msm table.msm-kv td.msm-v{overflow-wrap:anywhere}
 .msm-vrow{display:flex;align-items:baseline}
 .msm-vrow .msm-dot{position:relative;top:-1px}
+
+/* site list */
+.msm-list{border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--shadow);overflow:hidden;margin:0 0 16px}
+.msm-site{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(0,1fr) minmax(0,1.15fr) auto;gap:10px 28px;align-items:center;padding:16px 20px;border-top:1px solid var(--line)}
+.msm-site:first-child{border-top:0}
+.msm-site:hover{background:var(--soft)}
+.msm-site-name{display:flex;align-items:center;font-weight:650;font-size:14.5px;letter-spacing:-.005em;min-width:0}
+.msm-site-name span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.msm-site-meta{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;margin:7px 0 0 16px}
+.msm-site-chips{display:inline-flex;flex-wrap:wrap;gap:4px}
+.msm-chip-sm{display:inline-block;font-size:11.5px;line-height:1.4;padding:1px 7px;border-radius:6px;background:var(--soft-2);white-space:nowrap}
+.msm-chip-site{font-size:12.5px;padding:3px 9px}
+.msm-site-ports{font-size:11.5px;opacity:.6;white-space:nowrap}
+.msm-site-stat{min-width:0}
+.msm-site-nums{font-size:13px;margin:0 0 7px;white-space:nowrap}
+.msm-site-nums b{font-size:15px;font-weight:700}
+.msm-sep{opacity:.4;margin:0 2px}
+.msm-site-top{display:grid;gap:3px;font-size:12.5px;min-width:0}
+.msm-site-top > div{display:flex;align-items:baseline;gap:8px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.msm-site-k{display:inline-block;width:58px;flex:none;font-size:11px;letter-spacing:.05em;text-transform:uppercase;opacity:.55}
+.msm-site-actions{display:flex;gap:6px;justify-content:flex-end}
+.msm-quiet summary{font-weight:600}
+@media (max-width:900px){.msm-site{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.msm-site-actions{justify-content:flex-start}}
+@media (max-width:560px){.msm-site{grid-template-columns:1fr}.msm-site-meta{margin-left:0}}
 
 /* tiles */
 .msm-tiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(240px,100%),1fr));gap:12px}

@@ -50,6 +50,7 @@ foreach my $f (@features) {
 print "</div></div>\n";
 
 my @releases = (
+    ['0.5.2', 'Redesigned Sites page: summary cards, site search, card rows for active sites with alias chips, and quiet sites folded away. Table spacing now holds against themes that force cell padding.'],
     ['0.5.1', 'The Alerts page buttons (save, send test, preview) now sit in one row.'],
     ['0.5.0', 'Professional HTML alert e-mails with a plain-text fallback, an e-mail preview on the Alerts page, and a setting for the Webmin address used in alert links.'],
     ['0.4.1', 'Interface fixes: table cells keep their spacing under every Webmin theme, card icons are centred, and code snippets use neutral colours.'],
