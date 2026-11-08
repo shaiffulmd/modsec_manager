@@ -1,0 +1,8 @@
+# Build outputs (run ./build.sh; attach to a GitHub release instead)
+*.wbm.gz
+webmin-modsec-manager-*.tar.gz
+
+# OS / editor
+.DS_Store
+._*
+*.swp

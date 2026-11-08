@@ -1,0 +1,11 @@
+index_title=ModSecurity Manager
+index_return=module index
+mode_title=Protection
+exclusions_title=Custom exclusions
+logs_title=Logs
+actions_title=Maintenance
+save=Save
+cancel=Cancel
+reload=Reload Apache
+configtest=Run config test
+acl_edit=Can change ModSecurity settings, run apt and reload Apache?
