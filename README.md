@@ -27,6 +27,19 @@ Webmin module for managing Apache + ModSecurity on Ubuntu 24.04 or newer servers
   threshold, checked by a cron job in `/etc/cron.d/webmin-modsec-manager`
   - HTML e-mail with a plain-text fallback, sent through the local `sendmail`; preview it
     from the Alerts page without sending
+- **AI bots**: block (403) or only log known AI crawlers by User-Agent, grouped as
+  training crawlers (GPTBot, ClaudeBot, CCBot, Bytespider, ...), AI search crawlers and
+  user-triggered fetchers (ChatGPT-User, Claude-User, ...)
+  - rules live in `/etc/modsecurity/modsec-ai-bots.conf` (ids 1100100-1100109), written
+    from the ticked bots, config-tested and rolled back on failure
+  - leave chosen sites open, let `/robots.txt` through, and see which bots were caught
+- **Cloudflare**: checks the server is ready before attacker IPs are sent to Cloudflare
+  - `mod_remoteip` loaded, `RemoteIPHeader CF-Connecting-IP`, and only Cloudflare's
+    current ranges (from `api.cloudflare.com`) trusted, so the header cannot be faked
+  - recent audit log events carry visitor addresses, not Cloudflare's
+  - which sites resolve to Cloudflare (proxied) and which go straight to the server
+  - one-click setup writes `conf-available/remoteip-cloudflare.conf`, enables it with
+    `a2enmod remoteip` and `a2enconf`, and rolls back if the config test fails
 - Edit `modsecurity.conf`, `security2.conf` and the custom exclusions file
 - List, edit, enable and disable rule files (including the CRS `rules/` directory)
 - Every change is backed up (last 10 kept), checked with `apachectl configtest`,

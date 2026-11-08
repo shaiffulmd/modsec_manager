@@ -52,6 +52,8 @@ sub paths {
         systemctl              => cfg('systemctl', '/usr/bin/systemctl'),
         a2enmod                => cfg('a2enmod', '/usr/sbin/a2enmod'),
         a2dismod               => cfg('a2dismod', '/usr/sbin/a2dismod'),
+        a2enconf               => cfg('a2enconf', '/usr/sbin/a2enconf'),
+        a2disconf              => cfg('a2disconf', '/usr/sbin/a2disconf'),
         apt_get                => cfg('apt_get', '/usr/bin/apt-get'),
         dpkg_query             => cfg('dpkg_query', '/usr/bin/dpkg-query'),
         rule_dirs              => cfg('rule_dirs', '/etc/modsecurity,/etc/modsecurity/crs,/usr/share/modsecurity-crs,/usr/share/modsecurity-crs/rules'),
@@ -1619,6 +1621,677 @@ sub alert_state_file {
 }
 
 # ---------------------------------------------------------------------------
+# Cloudflare readiness
+# ---------------------------------------------------------------------------
+# Sending attacker IPs to Cloudflare only works if ModSecurity logs each
+# visitor's real address. Behind Cloudflare's proxy that needs mod_remoteip to
+# read CF-Connecting-IP, and to accept that header from Cloudflare's own
+# addresses only. Without it the log holds Cloudflare edge addresses, or
+# anyone can fake the header and get an innocent address blocked.
+
+# Cloudflare's published ranges (https://www.cloudflare.com/ips/), used when
+# the live list cannot be fetched and no saved copy exists.
+my @CF_BUILTIN_RANGES = qw(
+    173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18
+    108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17
+    162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22
+    2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32
+    2a06:98c0::/29 2c0f:f248::/32
+);
+
+# Packed IPv4 (4 bytes) or IPv6 (16 bytes) address, or undef. IPv4-mapped
+# IPv6 addresses (::ffff:1.2.3.4) come back as IPv4.
+sub ip_pack {
+    my ($ip) = @_;
+    return undef if (!defined($ip));
+    $ip =~ s/^\[(.*)\]$/$1/;
+    $ip =~ s/%.*$//;
+    require Socket;
+    if ($ip =~ /^\d{1,3}(?:\.\d{1,3}){3}$/) {
+        return Socket::inet_pton(Socket::AF_INET(), $ip);
+    }
+    return undef if ($ip !~ /:/ || $ip !~ /^[0-9a-f:.]+$/i);
+    my $b = Socket::inet_pton(Socket::AF_INET6(), $ip);
+    return substr($b, 12) if (defined($b) && substr($b, 0, 12) eq ("\0" x 10) . "\xff\xff");
+    return $b;
+}
+
+# "addr", "addr/len" or "addr/255.255.0.0" -> { net, len, text }, or undef.
+sub cidr_parse {
+    my ($s) = @_;
+    return undef if (!defined($s));
+    my ($addr, $mask) = split(m#/#, $s, 2);
+    my $net = ip_pack($addr);
+    return undef if (!defined($net));
+    my $max = length($net) * 8;
+    my $len = $max;
+    if (defined($mask)) {
+        if ($mask =~ /^\d{1,3}$/) {
+            $len = $mask;
+        } elsif (length($net) == 4 && defined(my $m = ip_pack($mask))) {
+            my $bits = unpack('B32', $m);
+            return undef if ($bits !~ /^(1*)0*$/);
+            $len = length($1);
+        } else {
+            return undef;
+        }
+    }
+    return undef if ($len > $max);
+    return { net => $net, len => $len, text => $s };
+}
+
+# True if parsed range $outer contains parsed range (or address) $inner.
+sub cidr_contains {
+    my ($outer, $inner) = @_;
+    return 0 if (length($outer->{net}) != length($inner->{net}) || $outer->{len} > $inner->{len});
+    my $n = $outer->{len};
+    return substr(unpack('B*', $outer->{net}), 0, $n) eq substr(unpack('B*', $inner->{net}), 0, $n);
+}
+
+sub ip_in_ranges {
+    my ($ip, $ranges) = @_;
+    my $c = cidr_parse($ip) || return 0;
+    foreach my $r (@$ranges) {
+        return 1 if (cidr_contains($r, $c));
+    }
+    return 0;
+}
+
+# Small HTTPS client: HTTP::Tiny when it has SSL support, else curl. Header
+# values (such as an API token) and the body reach curl on stdin, never on
+# the command line. Returns ($ok, $body, $error, $status).
+sub https_request {
+    my ($method, $url, $headers, $body) = @_;
+    $headers ||= {};
+    my %m = module_meta();
+    my $agent = "webmin-modsec-manager/$m{version}";
+    require HTTP::Tiny;
+    if (HTTP::Tiny->can_ssl()) {
+        my $r = HTTP::Tiny->new(timeout => 10, agent => $agent)->request($method, $url,
+            { headers => $headers, (defined($body) ? (content => $body) : ()) });
+        my $err = $r->{success} ? undef : $r->{status} == 599 ? $r->{content} : "HTTP $r->{status} $r->{reason}";
+        return ($r->{success} ? 1 : 0, $r->{content}, $err, $r->{status});
+    }
+    return (0, '', "No HTTPS client available (install libio-socket-ssl-perl or curl)", 0)
+        if (!-x '/usr/bin/curl');
+    my $q = sub {
+        my ($s) = @_;
+        $s =~ s/(["\\])/\\$1/g;
+        $s =~ s/\r/\\r/g;
+        $s =~ s/\n/\\n/g;
+        return "\"$s\"";
+    };
+    my $conf = "url = " . $q->($url) . "\nrequest = " . $q->($method) . "\nuser-agent = " . $q->($agent) . "\n";
+    $conf .= "header = " . $q->("$_: $headers->{$_}") . "\n" foreach (sort keys %$headers);
+    $conf .= "data-raw = " . $q->($body) . "\n" if (defined($body));
+    $conf .= "write-out = " . $q->("\n%{http_code}") . "\n";
+    my ($code, $out) = run_command_list({ _stdin => $conf }, '/usr/bin/curl', '-sS', '-m', '10', '-K', '-');
+    return (0, '', "curl failed: $out", 0) if ($code != 0);
+    my $status = $out =~ s/\n?(\d{3})\s*$// ? $1 : 0;
+    my $ok = $status >= 200 && $status < 300 ? 1 : 0;
+    return ($ok, $out, $ok ? undef : "HTTP $status", $status);
+}
+
+sub cf_ranges_cache_file {
+    return ($module_config_directory || "/etc/webmin/modsec-manager") . "/cloudflare-ips.txt";
+}
+
+# Cloudflare's address ranges as text CIDRs. With $live, ask the Cloudflare
+# API first and save the answer; otherwise (or if that fails) use the saved
+# copy, then the built-in list. Returns (\@ranges, $source, $error) where
+# $source is 'live', 'saved' or 'built-in'.
+sub cf_ip_ranges {
+    my ($live) = @_;
+    my $err;
+    my $cache = cf_ranges_cache_file();
+    if ($live) {
+        my ($ok, $body, $e) = https_request('GET', 'https://api.cloudflare.com/client/v4/ips');
+        my $j = $ok ? eval { require JSON::PP; JSON::PP->new->decode($body) } : undef;
+        my $res = ref($j) eq 'HASH' && $j->{success} && ref($j->{result}) eq 'HASH' ? $j->{result} : {};
+        my @l = grep { !ref($_) && cidr_parse($_) }
+                (@{$res->{ipv4_cidrs} || []}, @{$res->{ipv6_cidrs} || []});
+        if (@l >= 5) {
+            my $dir = File::Basename::dirname($cache);
+            write_text_file($cache, "# Cloudflare IP ranges from api.cloudflare.com, saved by ModSecurity Manager\n" .
+                                    join("\n", @l) . "\n", 0644) if (-d $dir && -w $dir);
+            return (\@l, 'live', undef);
+        }
+        $err = $ok ? "Unexpected answer from the Cloudflare API" : ($e || 'Request failed');
+    }
+    my @saved = grep { cidr_parse($_) } map { /^\s*([0-9a-f:.\/]+)\s*$/i ? $1 : () }
+                split(/\n/, read_text_file($cache));
+    return (\@saved, 'saved', $err) if (@saved >= 5);
+    return ([ @CF_BUILTIN_RANGES ], 'built-in', $err);
+}
+
+# Apache's configuration root (/etc/apache2), from the security2.conf path.
+sub apache_root {
+    my %p = paths();
+    my $d = File::Basename::dirname(File::Basename::dirname($p{apache_enabled_conf}));
+    return -d "$d/mods-available" ? $d : '/etc/apache2';
+}
+
+# The files Apache loads on Debian/Ubuntu: apache2.conf, ports.conf and the
+# enabled modules, conf snippets and sites.
+sub apache_loaded_files {
+    my %p = paths();
+    my $root = apache_root();
+    my @f = ("$root/apache2.conf", "$root/ports.conf");
+    foreach my $d (["$root/mods-enabled", qr/\.(?:load|conf)$/], ["$root/conf-enabled", qr/\.conf$/],
+                   [$p{apache_sites_dir}, qr/\.conf$/]) {
+        opendir(my $dh, $d->[0]) || next;
+        push(@f, map { "$d->[0]/$_" } sort grep { /$d->[1]/ } readdir($dh));
+        closedir($dh);
+    }
+    return grep { -f $_ } @f;
+}
+
+# Is an Apache module loaded? Asks apachectl -M, else looks in mods-enabled.
+sub apache_module_loaded {
+    my ($name) = @_;
+    my %p = paths();
+    if (-x $p{apachectl}) {
+        my ($code, $out) = run_command_list($p{apachectl}, '-M');
+        return $out =~ /^\s*\Q$name\E_module\b/m ? 1 : 0 if ($code == 0);
+    }
+    return -e apache_root() . "/mods-enabled/$name.load" ? 1 : 0;
+}
+
+# mod_remoteip directives in the loaded config:
+# list of { directive (lower case), args, file, line, vhost (inside <VirtualHost>) }.
+sub remoteip_directives {
+    my @d;
+    foreach my $f (apache_loaded_files()) {
+        my ($depth, $n) = (0, 0);
+        foreach my $l (split(/\n/, read_text_file($f))) {
+            $n++;
+            next if ($l =~ /^\s*#/);
+            if ($l =~ /^\s*<VirtualHost\b/i) { $depth++; next; }
+            if ($l =~ /^\s*<\/VirtualHost\s*>/i) { $depth-- if ($depth); next; }
+            next if ($l !~ /^\s*(RemoteIP(?:Header|TrustedProxyList|TrustedProxy|InternalProxyList|InternalProxy))\s+(.*?)\s*$/i);
+            push(@d, { directive => lc($1), args => $2, file => $f, line => $n, vhost => $depth ? 1 : 0 });
+        }
+    }
+    return @d;
+}
+
+# Name and paths of the conf snippet this module manages.
+sub cf_realip_conf_name { return 'remoteip-cloudflare'; }
+sub cf_realip_conf_file { return apache_root() . "/conf-available/" . cf_realip_conf_name() . ".conf"; }
+sub cf_realip_conf_link { return apache_root() . "/conf-enabled/" . cf_realip_conf_name() . ".conf"; }
+
+sub is_managed_realip_file {
+    my ($f) = @_;
+    return File::Basename::basename($f) eq cf_realip_conf_name() . ".conf" ? 1 : 0;
+}
+
+sub cf_realip_conf_text {
+    my ($ranges) = @_;
+    return "# Real visitor addresses for sites behind Cloudflare.\n" .
+           "# Managed by Webmin ModSecurity Manager (Cloudflare page); changes here are overwritten.\n" .
+           "<IfModule remoteip_module>\n" .
+           "    RemoteIPHeader CF-Connecting-IP\n" .
+           join('', map { "    RemoteIPTrustedProxy $_\n" } @$ranges) .
+           "</IfModule>\n";
+}
+
+# Addresses a host name resolves to (IPv4 and IPv6, de-duplicated).
+sub resolve_host {
+    my ($host) = @_;
+    require Socket;
+    my ($err, @res) = Socket::getaddrinfo($host, undef, { socktype => Socket::SOCK_STREAM() });
+    return () if ($err);
+    my (%seen, @ips);
+    foreach my $r (@res) {
+        my $ip;
+        if ($r->{family} == Socket::AF_INET()) {
+            my (undef, $a) = Socket::unpack_sockaddr_in($r->{addr});
+            $ip = Socket::inet_ntop(Socket::AF_INET(), $a);
+        } elsif ($r->{family} == Socket::AF_INET6()) {
+            my (undef, $a) = Socket::unpack_sockaddr_in6($r->{addr});
+            $ip = Socket::inet_ntop(Socket::AF_INET6(), $a);
+        }
+        push(@ips, $ip) if (defined($ip) && !$seen{$ip}++);
+    }
+    return @ips;
+}
+
+# File mtime on the same scale as log_time_epoch (local wall clock as UTC).
+sub local_epoch_of {
+    my ($t) = @_;
+    require Time::Local;
+    my @l = localtime($t);
+    return Time::Local::timegm(@l[0 .. 5]);
+}
+
+sub is_loopback_ip {
+    my ($ip) = @_;
+    return ip_in_ranges($ip, [ map { cidr_parse($_) } ('127.0.0.0/8', '::1/128') ]);
+}
+
+# Everything the Cloudflare page checks. Options: live => ask the Cloudflare
+# API for its current ranges; dns => resolve each site's name.
+# Returns a hash with checks => [ { id, state (ok|warn|bad|na), title,
+# detail (HTML), fix (action name or '') } ], ready, sites, ranges, ...
+sub cloudflare_readiness {
+    my (%o) = @_;
+    my (%r, @checks);
+    my $e = sub { &html_escape(join('', @_)) };
+    my $loc = sub { my ($d) = @_; "<span class='msm-path'>" . $e->("$d->{file}:$d->{line}") . "</span>" };
+
+    my ($ranges, $src, $rerr) = cf_ip_ranges($o{live});
+    my @cf = grep { $_ } map { cidr_parse($_) } @$ranges;
+    @r{qw(ranges range_source range_error)} = ($ranges, $src, $rerr);
+
+    # 1. Can this server talk to the Cloudflare API?
+    if ($o{live}) {
+        push(@checks, { id => 'api', title => 'Cloudflare API reachable',
+            state => $src eq 'live' ? 'ok' : 'bad', fix => '',
+            detail => $src eq 'live'
+                ? "Fetched Cloudflare's current address ranges from api.cloudflare.com."
+                : "Could not reach api.cloudflare.com: " . $e->($rerr) .
+                  ". Blocking needs outbound HTTPS from this server (HTTP::Tiny with IO::Socket::SSL, or curl)." });
+    }
+
+    # 2. mod_remoteip loaded.
+    my $mod = apache_module_loaded('remoteip');
+    my @dir = remoteip_directives();
+    my @headers = grep { $_->{directive} eq 'remoteipheader' } @dir;
+    my @foreign = grep { !is_managed_realip_file($_->{file}) } @headers;
+    my $can_fix = !@foreign ? 'realip' : '';
+    $r{managed} = -e cf_realip_conf_file() ? 1 : 0;
+    $r{managed_on} = -e cf_realip_conf_link() ? 1 : 0;
+    push(@checks, { id => 'module', title => 'Apache mod_remoteip enabled',
+        state => $mod ? 'ok' : 'bad', fix => $mod ? '' : $can_fix,
+        detail => $mod ? "The <b>remoteip</b> module is loaded."
+                       : "The <b>remoteip</b> module is not loaded, so Apache and ModSecurity only see Cloudflare's address." });
+
+    # 3. RemoteIPHeader CF-Connecting-IP.
+    my @global = grep { !$_->{vhost} } @headers;
+    my ($hstate, $hdetail);
+    if (!@headers) {
+        ($hstate, $hdetail) = ('bad', "No <code>RemoteIPHeader</code> is set. Cloudflare sends the visitor's address in " .
+                                      "<code>CF-Connecting-IP</code>; Apache has to be told to use it.");
+    } else {
+        my $h = $global[-1] || $headers[-1];
+        my $name = (split(/\s+/, $h->{args}))[0] || '';
+        if (lc($name) eq 'cf-connecting-ip') {
+            ($hstate, $hdetail) = ('ok', "<code>RemoteIPHeader CF-Connecting-IP</code> in " . $loc->($h) . ".");
+        } elsif (lc($name) eq 'x-forwarded-for') {
+            ($hstate, $hdetail) = ('warn', "<code>RemoteIPHeader X-Forwarded-For</code> in " . $loc->($h) .
+                ". This works with Cloudflare, but <code>CF-Connecting-IP</code> is the header Cloudflare recommends.");
+        } else {
+            ($hstate, $hdetail) = ('bad', "<code>RemoteIPHeader " . $e->($name) . "</code> in " . $loc->($h) .
+                ". Cloudflare does not send this header; use <code>CF-Connecting-IP</code>.");
+        }
+        if (!@global && $hstate ne 'bad') {
+            $hstate = 'warn';
+            $hdetail .= " It is only set inside <code>&lt;VirtualHost&gt;</code> blocks, so other sites still log Cloudflare's address.";
+        }
+    }
+    push(@checks, { id => 'header', title => 'Real-IP header is CF-Connecting-IP', state => $hstate,
+                    detail => $hdetail, fix => $hstate eq 'ok' ? '' : $can_fix });
+
+    # 4. Header accepted only from Cloudflare.
+    my (@trusted, @unparsed, @wide);
+    foreach my $d (grep { $_->{directive} =~ /proxy/ } @dir) {
+        my @items;
+        if ($d->{directive} =~ /list$/) {
+            my $f = $d->{args};
+            $f =~ s/^["']|["']$//g;
+            $f = apache_root() . "/$f" if ($f !~ m#^/#);
+            foreach my $l (split(/\n/, read_text_file($f))) {
+                $l =~ s/#.*$//;
+                push(@items, split(/\s+/, $l));
+            }
+        } else {
+            @items = split(/\s+/, $d->{args});
+        }
+        foreach my $i (grep { $_ ne '' } @items) {
+            my $c = cidr_parse($i);
+            if (!$c) { push(@unparsed, $i); next; }
+            push(@trusted, $c);
+            push(@wide, $i) if ($c->{len} < (length($c->{net}) == 4 ? 8 : 16));
+        }
+    }
+    my @missing = grep { my $cf = $_; !grep { cidr_contains($_, $cf) } @trusted } @cf;
+    $r{missing_ranges} = [ map { $_->{text} } @missing ];
+    my ($tstate, $tdetail);
+    if (@wide) {
+        ($tstate, $tdetail) = ('bad', "Trusted proxies include " . $e->(join(', ', @wide)) .
+            ", which lets almost any client set its own address. Trust only Cloudflare's ranges.");
+    } elsif (!@trusted && !@unparsed) {
+        ($tstate, $tdetail) = ('bad', "No <code>RemoteIPTrustedProxy</code> is set. " . (@headers
+            ? "mod_remoteip then accepts the header from any client, so an attacker could fake " .
+              "<code>CF-Connecting-IP</code> and get someone else's address blocked."
+            : "Cloudflare's ranges must be trusted, and only them, so nobody else can fake the visitor's address."));
+    } elsif (@missing) {
+        ($tstate, $tdetail) = ('warn', scalar(@missing) . " of " . scalar(@cf) . " Cloudflare ranges are not trusted (" .
+            $e->(join(', ', map { $_->{text} } @missing[0 .. ($#missing < 3 ? $#missing : 3)])) .
+            (@missing > 4 ? ', ...' : '') . "). Visitors arriving through them are logged with Cloudflare's address.");
+    } else {
+        ($tstate, $tdetail) = ('ok', "All " . scalar(@cf) . " Cloudflare ranges are trusted" .
+            (@unparsed ? "; host names that could not be checked: " . $e->(join(', ', @unparsed)) : "") . ".");
+    }
+    push(@checks, { id => 'trusted', title => 'Header accepted from Cloudflare only', state => $tstate,
+                    detail => $tdetail, fix => $tstate eq 'ok' ? '' : $can_fix });
+
+    # 5. Does the audit log actually hold visitor addresses? Events logged
+    # before the real-IP config last changed do not count.
+    my (undef, $txs, $file, $lerr) = read_recent_log('audit');
+    my $since = 0;
+    foreach my $d (@dir) {
+        my $m = (stat($d->{file}))[9];
+        $since = local_epoch_of($m) if ($m && local_epoch_of($m) > $since);
+    }
+    my ($n, $from_cf, $from_lo, $last_cf) = (0, 0, 0, '');
+    foreach my $tx (@$txs) {
+        my $t = log_time_epoch($tx->{time});
+        next if ($since && (!defined($t) || $t <= $since));
+        my $c = $tx->{client} || next;
+        $n++;
+        if (ip_in_ranges($c, \@cf)) { $from_cf++; $last_cf ||= $c; }
+        $from_lo++ if (is_loopback_ip($c));
+    }
+    my ($lstate, $ldetail);
+    if (!$n) {
+        ($lstate, $ldetail) = ('na', $lerr ? $e->($lerr) :
+            "No audit log events" . ($since ? " since the real-IP settings last changed" : "") .
+            " yet. This check runs once ModSecurity logs a request.");
+    } elsif ($from_cf) {
+        ($lstate, $ldetail) = ('bad', "A Cloudflare address appears in $from_cf of the last " . plural($n, "event") . " (for example " .
+            $e->($last_cf) . "). ModSecurity is seeing Cloudflare, not the visitor" .
+            ($since ? "; if you just changed the config, reload Apache" : "") . ".");
+    } elsif ($from_lo * 2 > $n) {
+        ($lstate, $ldetail) = ('warn', "127.0.0.1 appears in $from_lo of the last " . plural($n, "event") . ". With a Cloudflare Tunnel or a local " .
+            "proxy, add its address to the trusted proxies so the visitor's address is used.");
+    } else {
+        ($lstate, $ldetail) = ('ok', "None of the last " . plural($n, "event") . " came from a Cloudflare address.");
+    }
+    push(@checks, { id => 'log', title => 'ModSecurity logs real visitor addresses', state => $lstate,
+                    detail => $ldetail, fix => '' });
+
+    # 6. Which sites are proxied by Cloudflare?
+    my @sites;
+    if ($o{dns}) {
+        my $count = 0;
+        foreach my $v (apache_vhosts()) {
+            my $name = $v->{name};
+            next if ($name !~ /\./ || $name =~ /[*?]/ || defined(ip_pack($name)) || $name =~ /(?:^|\.)localhost$/);
+            last if (++$count > 40);
+            my @ips = resolve_host($name);
+            my $on = grep { ip_in_ranges($_, \@cf) } @ips;
+            push(@sites, { name => $name, ips => \@ips,
+                           state => !@ips ? 'none' : $on == @ips ? 'proxied' : $on ? 'mixed' : 'direct' });
+        }
+        my $prox = grep { $_->{state} ne 'direct' && $_->{state} ne 'none' } @sites;
+        my $dir_n = grep { $_->{state} eq 'direct' } @sites;
+        push(@checks, { id => 'sites', title => 'Sites proxied through Cloudflare', fix => '',
+            state => !@sites ? 'na' : $prox ? 'ok' : 'warn',
+            detail => !@sites ? "No sites with a public name were found in the enabled Apache sites."
+                    : $prox ? "$prox of " . scalar(@sites) . " sites resolve to Cloudflare." .
+                              ($dir_n ? " $dir_n go straight to this server; Cloudflare blocks do not protect them." : "")
+                    : "None of the " . scalar(@sites) . " sites resolve to Cloudflare. Blocking at Cloudflare only stops " .
+                      "traffic to proxied (orange cloud) sites; use the server firewall for the others." });
+    }
+    $r{sites} = \@sites;
+
+    $r{checks} = \@checks;
+    my %need = map { $_ => 1 } qw(api module header trusted log);
+    $r{blocking} = [ grep { $need{$_->{id}} && $_->{state} eq 'bad' } @checks ];
+    $r{ready} = !@{$r{blocking}} && !grep { $_->{id} =~ /^(?:sites|log)$/ && $_->{state} ne 'ok' } @checks;
+    $r{can_fix} = $can_fix;
+    $r{foreign_headers} = \@foreign;
+    $r{directives} = \@dir;
+    return %r;
+}
+
+# Write the managed conf snippet (RemoteIPHeader CF-Connecting-IP and every
+# Cloudflare range as a trusted proxy), enable remoteip and the snippet, and
+# test the config. Everything this changed is undone if the test fails.
+# Returns ($ok, \@steps, $message); each step is [title, code, output].
+sub cf_setup_realip {
+    my %p = paths();
+    my @steps;
+    my @foreign = grep { $_->{directive} eq 'remoteipheader' && !is_managed_realip_file($_->{file}) } remoteip_directives();
+    if (@foreign) {
+        return (0, [], "A RemoteIPHeader is already set in $foreign[0]{file} line $foreign[0]{line}. " .
+                       "Change that file by hand so two settings do not conflict.");
+    }
+    my ($ranges, $src, $err) = cf_ip_ranges(1);
+    my $file = cf_realip_conf_file();
+    -d File::Basename::dirname($file) || return (0, [], "Directory not found: " . File::Basename::dirname($file));
+    my $existed = -e $file;
+    my $backup = $existed ? backup_file($file) : undef;
+    write_text_file($file, cf_realip_conf_text($ranges), 0644);
+    push(@steps, ["Wrote $file (" . scalar(@$ranges) . " Cloudflare ranges, $src list)", 0,
+                  $err ? "Live list not available ($err); used the $src list.\n" : '']);
+
+    my ($mod_added, $conf_added, $fail) = (0, 0, 0);
+    if (!apache_module_loaded('remoteip')) {
+        my ($c, $o) = run_command_list($p{a2enmod}, 'remoteip');
+        push(@steps, ['a2enmod remoteip', $c, $o]);
+        $c == 0 ? ($mod_added = 1) : ($fail = 1);
+    }
+    if (!$fail && !-e cf_realip_conf_link()) {
+        my ($c, $o) = run_command_list($p{a2enconf}, cf_realip_conf_name());
+        push(@steps, ['a2enconf ' . cf_realip_conf_name(), $c, $o]);
+        $c == 0 ? ($conf_added = 1) : ($fail = 1);
+    }
+    if (!$fail) {
+        my ($c, $o) = apache_configtest();
+        push(@steps, ['Apache config test', $c, $o]);
+        $fail = 1 if ($c != 0);
+    }
+    if ($fail) {
+        push(@steps, ['Rollback: a2disconf ' . cf_realip_conf_name(), run_command_list($p{a2disconf}, cf_realip_conf_name())])
+            if ($conf_added);
+        push(@steps, ['Rollback: a2dismod remoteip', run_command_list($p{a2dismod}, 'remoteip')]) if ($mod_added);
+        $existed ? restore_backup($file, $backup) : remove_created_file($file);
+        return (0, \@steps, "Setup failed and every change was undone. See the output below.");
+    }
+    return (1, \@steps, "Real visitor addresses are configured. Reload Apache to apply, then wait for new requests " .
+                        "before checking the audit log again.");
+}
+
+# ---------------------------------------------------------------------------
+# AI crawlers
+# ---------------------------------------------------------------------------
+# A managed ModSecurity rule file that blocks (or only logs) AI crawlers by
+# the User-Agent token they publish. Honest crawlers are stopped this way;
+# a scraper that pretends to be a browser is not, and CRS still handles
+# scanners by behaviour. Tokens that exist only in robots.txt (such as
+# Google-Extended and Applebot-Extended) never appear in a User-Agent, so
+# they are not listed here.
+
+# [token, owner, group]. Tokens are matched case-insensitively anywhere in
+# the User-Agent (ModSecurity @pm), so they must not contain spaces.
+my @AI_BOTS = (
+    ['GPTBot',                       'OpenAI',          'training'],
+    ['ClaudeBot',                    'Anthropic',       'training'],
+    ['anthropic-ai',                 'Anthropic (older)', 'training'],
+    ['Claude-Web',                   'Anthropic (older)', 'training'],
+    ['CCBot',                        'Common Crawl',    'training'],
+    ['Bytespider',                   'ByteDance',       'training'],
+    ['Meta-ExternalAgent',           'Meta',            'training'],
+    ['FacebookBot',                  'Meta',            'training'],
+    ['Amazonbot',                    'Amazon',          'training'],
+    ['cohere-training-data-crawler', 'Cohere',          'training'],
+    ['cohere-ai',                    'Cohere',          'training'],
+    ['Diffbot',                      'Diffbot',         'training'],
+    ['AI2Bot',                       'Allen Institute', 'training'],
+    ['omgili',                       'Webz.io',         'training'],
+    ['ImagesiftBot',                 'ImageSift',       'training'],
+    ['Timpibot',                     'Timpi',           'training'],
+    ['PanguBot',                     'Huawei',          'training'],
+    ['img2dataset',                  'Dataset tool',    'training'],
+    ['OAI-SearchBot',                'OpenAI',          'search'],
+    ['Claude-SearchBot',             'Anthropic',       'search'],
+    ['PerplexityBot',                'Perplexity',      'search'],
+    ['YouBot',                       'You.com',         'search'],
+    ['DuckAssistBot',                'DuckDuckGo',      'search'],
+    ['ChatGPT-User',                 'OpenAI',          'user'],
+    ['Claude-User',                  'Anthropic',       'user'],
+    ['Perplexity-User',              'Perplexity',      'user'],
+    ['MistralAI-User',               'Mistral',         'user'],
+    ['Meta-ExternalFetcher',         'Meta',            'user'],
+    ['Google-CloudVertexBot',        'Google',          'user'],
+);
+
+sub ai_bot_catalog {
+    return map { { token => $_->[0], owner => $_->[1], group => $_->[2] } } @AI_BOTS;
+}
+
+sub ai_bot_groups {
+    return (
+        ['training', 'Training crawlers', 'Collect pages to train AI models. Blocking them does not affect search engines.'],
+        ['search',   'AI search crawlers', 'Index pages for AI search and answers. Blocking them removes the site from those results.'],
+        ['user',     'Fetches for a user', 'An assistant opening a page because someone asked it to, like a browser would.'],
+    );
+}
+
+# Rule ids 1100100-1100109 are reserved for this file (custom exclusions use
+# 1000000-1099999).
+sub ai_bots_rule_id { return 1100103; }
+
+sub ai_bot_settings {
+    my %known = map { lc($_->[0]) => $_->[0] } @AI_BOTS;
+    my $list = cfg('ai_bots_list', join(',', map { $_->[0] } grep { $_->[2] eq 'training' } @AI_BOTS));
+    return (
+        enabled => cfg('ai_bots_enabled', 0) ? 1 : 0,
+        mode    => cfg('ai_bots_mode', 'block') eq 'log' ? 'log' : 'block',
+        bots    => [ grep { $_ } map { $known{lc($_)} } split(/\s*,\s*/, $list) ],
+        allow   => [ grep { /^[a-z0-9*.-]+$/ } split(/\s*,\s*/, lc(cfg('ai_bots_allow_sites', ''))) ],
+        robots  => cfg('ai_bots_robots', 1) ? 1 : 0,
+        file    => cfg('ai_bots_file', '/etc/modsecurity/modsec-ai-bots.conf'),
+    );
+}
+
+# Regex for Host headers of the given site names (aliases with * allowed).
+sub host_regex {
+    my @names = @_;
+    my @alt;
+    foreach my $n (@names) {
+        my $re = quotemeta(lc($n));
+        $re =~ s/\\\*/[a-z0-9.-]*/g;
+        push(@alt, $re);
+    }
+    return "^(?:" . join('|', @alt) . ")(?::[0-9]+)?\$";
+}
+
+# The managed rule file. %s is ai_bot_settings(); $hosts are the Host names
+# (with aliases) of the sites left open to AI crawlers.
+sub ai_bots_rule_text {
+    my ($s, $hosts) = @_;
+    my $t = "# AI crawler blocking.\n" .
+            "# Managed by Webmin ModSecurity Manager (AI bots page); changes here are overwritten.\n" .
+            "# Rule ids 1100100-1100109 are reserved for this file.\n\n";
+    if ($s->{robots}) {
+        $t .= "# Let crawlers read robots.txt, so well-behaved ones learn they are not welcome.\n" .
+              "SecRule REQUEST_FILENAME \"\@streq /robots.txt\" \\\n" .
+              "    \"id:1100101,phase:1,pass,nolog,t:none,skipAfter:MSM_AI_BOTS_END\"\n\n";
+    }
+    if (@$hosts) {
+        $t .= "# Sites left open to AI crawlers.\n" .
+              "SecRule REQUEST_HEADERS:Host \"\@rx " . host_regex(@$hosts) . "\" \\\n" .
+              "    \"id:1100102,phase:1,pass,nolog,t:none,t:lowercase,skipAfter:MSM_AI_BOTS_END\"\n\n";
+    }
+    my $action = $s->{mode} eq 'log'
+        ? "pass,log,auditlog,msg:'AI crawler detected'"
+        : "deny,status:403,log,auditlog,msg:'AI crawler blocked'";
+    $t .= "SecRule REQUEST_HEADERS:User-Agent \"\@pm " . join(' ', @{$s->{bots}}) . "\" \\\n" .
+          "    \"id:" . ai_bots_rule_id() . ",phase:1,$action,t:none,severity:'NOTICE',\\\n" .
+          "    logdata:'%{MATCHED_VAR}',tag:'modsec-manager/ai-bots'\"\n\n" .
+          "SecMarker MSM_AI_BOTS_END\n";
+    return $t;
+}
+
+# Host names (ServerName and ServerAlias) of the given enabled sites.
+sub site_host_names {
+    my %want = map { $_ => 1 } @_;
+    my @h;
+    foreach my $v (apache_vhosts()) {
+        next if (!$want{$v->{name}});
+        push(@h, $v->{name}, @{$v->{aliases}});
+    }
+    my %seen;
+    return grep { !$seen{$_}++ } @h;
+}
+
+# Is $file loaded by ModSecurity (directly or through a glob such as
+# IncludeOptional /etc/modsecurity/*.conf)?
+sub modsec_file_included {
+    my ($file) = @_;
+    my %p = paths();
+    return line_includes_file(read_text_file($p{apache_security_conf}), $file) ||
+           line_includes_file(read_text_file($p{modsecurity_conf}), $file);
+}
+
+# Write (or, when turned off, remove) the rule file and test the config.
+# Everything is put back if the test fails.
+# Returns ($code, $output, \@notes, $text).
+sub apply_ai_bots {
+    my (%s) = @_;
+    my %p = paths();
+    my $file = $s{file};
+    my @notes;
+    if (!$s{enabled}) {
+        return (0, '', ["The rule file was not there; nothing to remove."], '') if (!-e $file);
+        my $backup = backup_file($file);
+        unlink($file) || fail("Cannot remove $file: $!");
+        my ($code, $out) = apache_configtest();
+        if ($code != 0) {
+            restore_backup($file, $backup);
+            push(@notes, "Config test failed, so $file was put back.");
+        } else {
+            push(@notes, "Removed $file (backup: $backup).");
+        }
+        return ($code, $out, \@notes, '');
+    }
+    -d File::Basename::dirname($file) || fail("Directory not found: " . File::Basename::dirname($file));
+    my $text = ai_bots_rule_text(\%s, [ site_host_names(@{$s{allow}}) ]);
+    my ($inc_backup, $inc_added);
+    if (!modsec_file_included($file)) {
+        -e $p{modsecurity_conf} || fail("$p{modsecurity_conf} does not exist");
+        my $data = read_text_file($p{modsecurity_conf});
+        $inc_backup = backup_file($p{modsecurity_conf});
+        $data .= "\n" if ($data ne '' && substr($data, -1) ne "\n");
+        write_text_file($p{modsecurity_conf}, $data . "\n# AI crawler rules managed by Webmin\nIncludeOptional $file\n", 0644);
+        push(@notes, "Added IncludeOptional $file to $p{modsecurity_conf}.");
+        $inc_added = 1;
+    }
+    my ($code, $out, $backup, $reverted) = save_file_with_configtest($file, $text);
+    if ($code != 0) {
+        restore_backup($p{modsecurity_conf}, $inc_backup) if ($inc_added);
+        push(@notes, "Config test failed, so the change was undone.");
+    } else {
+        push(@notes, "Wrote $file" . ($backup ? " (backup: $backup)" : "") . ".");
+    }
+    return ($code, $out, \@notes, $text);
+}
+
+# AI crawler hits in the audit log, by bot token:
+# { token => { count, blocked, last, hosts => { host => n } } }.
+sub ai_bot_hits {
+    my ($txs) = @_;
+    my $id = ai_bots_rule_id();
+    my @tokens = map { $_->[0] } @AI_BOTS;
+    my %hits;
+    foreach my $tx (@$txs) {
+        my ($m) = grep { ($_->{id} || '') eq $id } @{$tx->{messages}};
+        next if (!$m);
+        my $ua = lc($m->{data} || '');
+        my ($tok) = grep { index($ua, lc($_)) >= 0 } @tokens;
+        my $h = $hits{$tok || 'Other'} ||= { count => 0, blocked => 0, last => '', hosts => {} };
+        $h->{count}++;
+        $h->{blocked}++ if (tx_blocked($tx));
+        $h->{last} ||= $tx->{time} || '';
+        $h->{hosts}{norm_host($tx->{host})}++ if ($tx->{host});
+    }
+    return \%hits;
+}
+
+# ---------------------------------------------------------------------------
 # HTML helpers and design system
 # ---------------------------------------------------------------------------
 
@@ -1660,6 +2333,8 @@ my %ICONS = (
     package  => '<path d="M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z"/><path d="M4 7.5l8 4.5 8-4.5M12 12v9"/>',
     wand     => '<path d="M4 20L15 9"/><path d="M17 3v4M15 5h4M19 11v2M18 12h2M11 3v2M10 4h2"/>',
     arrow    => '<path d="M5 12h14M13 6l6 6-6 6"/>',
+    cloud    => '<path d="M7 18.5h10.5a4 4 0 0 0 .4-7.98A6 6 0 0 0 6.3 9.1 4.7 4.7 0 0 0 7 18.5z"/>',
+    bot      => '<rect x="4" y="8" width="16" height="12" rx="3"/><path d="M12 4v4M9 13h.01M15 13h.01M9.5 17h5"/>',
 );
 sub icon {
     my ($name, $size) = @_;
@@ -1946,6 +2621,8 @@ sub print_nav {
         ['rules.cgi',      'Rules',       'list'],
         ['mode.cgi',       'Protection',  'sliders'],
         ['alerts.cgi',     'Alerts',      'bell'],
+        ['ai_bots.cgi',    'AI bots',     'bot'],
+        ['cloudflare.cgi', 'Cloudflare',  'cloud'],
         ['config_editor.cgi', 'Config',   'file'],
         ['actions.cgi',    'Maintenance', 'tool'],
         ['about.cgi',      'About',       'info'],

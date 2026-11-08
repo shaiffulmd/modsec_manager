@@ -160,6 +160,8 @@ my @tiles = (
     ['exclusion_builder.cgi', 'wand',     'Exclusion builder', 'Exclude a rule for one site, path or field'],
     ['mode.cgi',              'sliders',  'Protection',        'Engine mode, paranoia level and thresholds'],
     ['alerts.cgi',            'bell',     'Alerts',            'E-mail or Telegram when blocks spike'],
+    ['ai_bots.cgi',           'bot',      'AI bots',           'Block GPTBot, ClaudeBot and other AI crawlers'],
+    ['cloudflare.cgi',        'cloud',    'Cloudflare',        'Check the server is ready to block attackers at Cloudflare'],
     ['rules.cgi',             'list',     'Rules',             'Enable, disable or edit rule files'],
     ['config_editor.cgi',     'file',     'Config files',      'Edit modsecurity.conf and security2.conf'],
     ['actions.cgi',           'tool',     'Maintenance',       'Config test, reload and package updates'],

@@ -38,6 +38,8 @@ my @features = (
     ['wand',     'Exclusion builder',   'Exclude a rule for one site, path or request field, with a config test.'],
     ['sliders',  'Protection tuning',   'SecRuleEngine mode, paranoia level and anomaly thresholds.'],
     ['bell',     'Alerts',              'E-mail or Telegram when blocked requests spike.'],
+    ['bot',      'AI bot blocking',     'Block or log GPTBot, ClaudeBot, CCBot and other AI crawlers, per site.'],
+    ['cloud',    'Cloudflare readiness', 'Checks real visitor IPs behind Cloudflare and sets up mod_remoteip safely.'],
     ['shield',   'Safe changes',        'Every change is backed up, tested with apachectl and rolled back on failure.'],
     ['user',     'Access control',      'Give Webmin users read-only access to the module.'],
 );
@@ -50,6 +52,8 @@ foreach my $f (@features) {
 print "</div></div>\n";
 
 my @releases = (
+    ['0.7.0', 'New AI bots page: block or log known AI crawlers (training, AI search and user-triggered fetchers) by User-Agent with a managed ModSecurity rule file, leave chosen sites open, let robots.txt through, and see which bots were caught.'],
+    ['0.6.0', 'New Cloudflare page: checks that mod_remoteip logs real visitor addresses (CF-Connecting-IP, trusted Cloudflare ranges, audit log, site DNS) before attacker IPs are sent to Cloudflare, with a one-click real-IP setup that is rolled back if the config test fails.'],
     ['0.5.2', 'Redesigned Sites page: summary cards, site search, card rows for active sites with alias chips, and quiet sites folded away. Table spacing now holds against themes that force cell padding.'],
     ['0.5.1', 'The Alerts page buttons (save, send test, preview) now sit in one row.'],
     ['0.5.0', 'Professional HTML alert e-mails with a plain-text fallback, an e-mail preview on the Alerts page, and a setting for the Webmin address used in alert links.'],

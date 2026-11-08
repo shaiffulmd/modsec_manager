@@ -239,7 +239,7 @@ if (@txs) {
                   &html_escape($a->{ip}), "</b></a><div class='msm-ins-sub'>", &html_escape($a->{reason}), "</div></div>",
                   "<div class='msm-ins-side'><span><b>$a->{events}</b> requests &middot; $a->{blocked} blocked</span></div></div>";
         }
-        print "<p class='msm-meta' style='margin:10px 0 0'>To block an address outright use the firewall (Webmin &gt; Networking), not ModSecurity exclusions.</p>";
+        print "<p class='msm-meta' style='margin:10px 0 0'>To block an address outright use the firewall (Webmin &gt; Networking) or Cloudflare (see the <a href='cloudflare.cgi'>Cloudflare checks</a>), not ModSecurity exclusions.</p>";
     } else {
         print "<div class='msm-empty'>None found.</div>";
     }
