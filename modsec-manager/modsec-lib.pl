@@ -636,7 +636,8 @@ sub new_transaction {
     return { id => $id, messages => [] };
 }
 
-# Parse ModSecurity 2 Serial audit log lines into transactions.
+# Parse ModSecurity 2 Serial audit log lines into transactions. Entries cut
+# off at the start of the lines (no A section) are dropped.
 sub parse_serial_audit {
     my ($lines) = @_;
     my @tx;
@@ -650,6 +651,7 @@ sub parse_serial_audit {
                 push(@tx, $by_id{$id});
             }
             $cur = $by_id{$id};
+            $cur->{has_a} = 1 if ($sec eq 'A');
             $section = $sec;
             $first_in_section = 1;
             next;
@@ -674,7 +676,9 @@ sub parse_serial_audit {
         }
         $first_in_section = 0 if ($line ne '');
     }
-    return @tx;
+    # A transaction with no A section began before the lines we read (the tail
+    # window or a rotation cut it), so it has no time, client or request.
+    return grep { delete($_->{has_a}) } @tx;
 }
 
 # Parse one JSON audit record (ModSecurity 2.9 or libmodsecurity 3 layout).
@@ -754,7 +758,7 @@ sub read_recent_log {
     } else {
         @tx = parse_serial_audit($lines);
         # Fall back to error-log style lines if the file is not Serial format.
-        @tx = parse_error_log($lines) if (!@tx);
+        @tx = parse_error_log($lines) if (!@tx && !grep { /^--[0-9A-Za-z]+-[A-Z]--$/ } @$lines);
     }
     @tx = grep { @{$_->{messages}} || $_->{action} } @tx;
     return ($lines, [ reverse @tx ], $file, undef);
