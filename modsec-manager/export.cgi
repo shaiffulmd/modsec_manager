@@ -16,7 +16,8 @@ if ($what eq 'csv') {
     fail($err) if ($err);
     my $csv = events_csv($txs, $vhosts);
     &webmin_log("export", "csv", $file) if (defined(&webmin_log));
-    binmode(STDOUT);
+    # Under miniserv STDOUT is tied and has no binmode.
+    binmode(STDOUT) if (!tied(*STDOUT));
     print "Content-Type: text/csv; charset=utf-8\n",
           "Content-Disposition: attachment; filename=\"modsec-events-$stamp.csv\"\n",
           "Content-Length: ", length($csv), "\n\n", $csv;

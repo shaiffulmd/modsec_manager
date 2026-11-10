@@ -53,6 +53,7 @@ foreach my $f (@features) {
 print "</div></div>\n";
 
 my @releases = (
+    ['0.9.1', 'Fix log export under Webmin: downloads failed with "Can\'t locate object method BINMODE via package miniserv", because Webmin runs scripts with a tied STDOUT. The ZIP is now built in a small buffer and printed chunk by chunk.'],
     ['0.9.0', 'Log export: download the events shown on the Logs page as CSV (safe to open in Excel), or the raw audit log, rotated copies and optionally the Apache error log as a ZIP with a SHA-256 manifest. Raw files need edit access.'],
     ['0.8.0', 'New Blocked IPs page: block an attacker address at Cloudflare (account-level IP Access Rule), in a ModSecurity blocklist and in ufw, with an end time lifted by cron. Cloudflare, private, server and never-block addresses are refused. Likely attackers on the Logs page get a Block button.'],
     ['0.7.1', 'Cloudflare setup can now move real-IP settings out of VirtualHost blocks (as Virtualmin sites often have) into one setting for every site: the old lines are commented out with a backup, non-Cloudflare trusted proxies are kept, ranges that trust everyone are dropped, and all of it is undone if the config test fails.'],

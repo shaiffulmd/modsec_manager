@@ -2861,23 +2861,35 @@ sub export_stamp {
 # compressed are stored as they are. The last entry is manifest.txt:
 # $note, then the size and SHA-256 of every file, so a copy handed on can be
 # checked later. Returns '' or an error.
+#
+# Webmin runs CGI scripts inside miniserv, where STDOUT is a tied handle with
+# no binmode, so the ZIP is built in a small in-memory buffer that is printed
+# and emptied after every chunk, never written to STDOUT by IO::Compress.
 sub stream_zip {
     my ($files, $note, $out) = @_;
     require IO::Compress::Zip;
     require Digest::SHA;
     $out ||= \*STDOUT;
+    binmode($out) if (!tied(*$out));
     my $total = 0;
     $total += (-s $_ || 0) foreach (@$files);
     my %o = (Stream => 1, Zip64 => $total > 3_500_000_000 ? 1 : 0, BinModeIn => 1);
-    binmode($out);
+    my $zbuf = '';
+    my $flush = sub {
+        return if ($zbuf eq '');
+        print $out $zbuf;
+        $zbuf = '';
+    };
     my ($z, %used, @manifest);
     my $add = sub {
         my ($name, %e) = @_;
         if (!$z) {
-            $z = IO::Compress::Zip->new($out, %o, Name => $name, %e);
+            $z = IO::Compress::Zip->new(\$zbuf, %o, Name => $name, %e);
             return $z ? '' : "Cannot start the ZIP file: $IO::Compress::Zip::ZipError";
         }
-        return $z->newStream(%o, Name => $name, %e) ? '' : "Cannot add $name: $IO::Compress::Zip::ZipError";
+        my $ok = $z->newStream(%o, Name => $name, %e);
+        $flush->();
+        return $ok ? '' : "Cannot add $name: $IO::Compress::Zip::ZipError";
     };
     foreach my $f (@$files) {
         open(my $in, '<', $f) || next;
@@ -2895,6 +2907,7 @@ sub stream_zip {
         my ($buf, $size) = ('', 0);
         while (my $n = read($in, $buf, 1 << 20)) {
             $z->print($buf);
+            $flush->();
             $sha->add($buf);
             $size += $n;
         }
@@ -2907,6 +2920,7 @@ sub stream_zip {
     $z->print(($note || '') . "\nSHA-256                                                           Bytes  File\n" .
               join("\n", @manifest) . "\n");
     $z->close();
+    $flush->();
     return '';
 }
 
