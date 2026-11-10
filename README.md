@@ -19,6 +19,10 @@ Webmin module for managing Apache + ModSecurity on Ubuntu 24.04 or newer servers
   - *Possible false positives*: one rule on one site and path tripped by several
     ordinary clients, with an Exclude button
   - *Likely attackers*: scanners and clients tripping many rules
+  - **Export**: the events shown (with the current filters) as CSV, with formula-like
+    values defused for Excel; or the raw audit log, rotated copies and optionally the
+    Apache error log as a ZIP with a `manifest.txt` of SHA-256 checksums (needs edit
+    access, since raw logs can hold passwords and cookies)
 - **Exclusion builder**: scope an exclusion to one site, one path and a single request
   field (`ctl:ruleRemoveTargetById`), preview it, then append it with a config test
 - **Protection**: `SecRuleEngine` mode, CRS paranoia level and inbound/outbound

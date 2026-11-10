@@ -5,14 +5,8 @@ require './modsec-lib.pl';
 &ui_print_header(undef, $text{'logs_title'}, "");
 print_nav('logs.cgi', 'What ModSecurity saw recently. Click any bar to filter every chart and list on this page.');
 
-my $source = ($in{'source'} || '') eq 'error' ? 'error' : 'audit';
-my %f;
-foreach my $k ('rule', 'ip', 'host', 'path', 'site') {
-    $f{$k} = defined($in{$k}) ? $in{$k} : '';
-    $f{$k} =~ s/[\r\n]//g;
-}
-$f{blocked} = $in{'blocked'} ? 1 : 0;
-$f{history} = ($in{'history'} || 0) =~ /^([0-7])$/ ? $1 : 0;
+my ($source, $fref) = logs_filters(\%in);
+my %f = %$fref;
 
 # Link to this page with the current filters, overridden by %o.
 sub logs_url {
@@ -22,15 +16,9 @@ sub logs_url {
     return "logs.cgi" . (@p ? "?" . join("&amp;", @p) : "");
 }
 
-my ($raw, $all, $file, $err) = read_recent_log($source, $f{history});
-# A site filter matches its ServerName and every ServerAlias.
-my @vhosts = apache_vhosts();
-my $site_hosts;
-if ($f{site} ne '') {
-    my ($v) = grep { $_->{name} eq norm_host($f{site}) } @vhosts;
-    $site_hosts = { map { $_ => 1 } ($v ? ($v->{name}, grep { !/[*?]/ } @{$v->{aliases}}) : norm_host($f{site})) };
-}
-my @txs = filter_transactions($all, %f, hosts => $site_hosts);
+my ($raw, $all, $file, $err, $txref, $vref) = logs_select($source, \%f);
+my @txs = @$txref;
+my @vhosts = @$vref;
 
 
 # --- Filters ----------------------------------------------------------------
@@ -56,6 +44,7 @@ foreach my $k (@active) {
 if (@active || $f{blocked}) {
     print "<a href='logs.cgi?source=$source" . ($f{history} ? "&amp;history=$f{history}" : "") . "'>Clear filters</a>";
 }
+print "<a href='#export'>", icon('file', 14), "Export</a>" if (!$err);
 print "</form>\n";
 
 if ($err) {
@@ -321,6 +310,42 @@ if (@txs) {
     }
     print "</div>\n";
     print "<p class='msm-meta'>Hover a rule to see the matched data.</p>\n";
+}
+
+# --- Export -------------------------------------------------------------------
+
+{
+    my %q = (what => 'csv', source => $source, %f);
+    my $csv_url = "export.cgi?" . join("&amp;", map { "$_=" . &url_escape($q{$_}) }
+                                              grep { $q{$_} ne '' && $q{$_} ne '0' } sort keys %q);
+    my %p = paths();
+    my $alog = audit_log_path();
+    my $avail = rotated_log_count($alog);
+    my $size_of = sub { my $t = 0; $t += $_->[1] foreach (log_files_with_rotated(@_)); return $t; };
+    print "<div class='msm-panel' id='export' style='margin-top:18px'><div class='msm-panel-title'>Export</div>",
+          "<div class='msm-panel-sub'>Download what this page shows, or the log files themselves.</div>\n";
+    print "<div class='msm-ins'><div class='msm-ins-main'><b>Events as CSV</b><div class='msm-ins-sub'>The ",
+          plural(scalar(@txs), 'event'), " shown above", (@active || $f{blocked} ? ", with the current filters" : ""),
+          ": time, client, site, request, status, rules and messages. Opens in Excel or Google Sheets.</div></div>",
+          "<div class='msm-ins-side'><a class='msm-btn' href='$csv_url'>", icon('file', 15), "Download CSV</a></div></div>\n";
+    if (can_edit()) {
+        my $opts = join('', map {
+            my $n = $_;
+            "<option value='$n'" . ($n == ($f{history} > $avail ? $avail : $f{history}) ? " selected" : "") . ">" .
+            ($n ? "+ $n rotated log" . ($n > 1 ? "s" : "") . " (" . human_size($size_of->($alog, $n)) . ")"
+                : "Current log only (" . human_size($size_of->($alog, 0)) . ")") . "</option>"
+        } (0 .. $avail));
+        print "<form method='get' action='export.cgi' class='msm-ins'>", &ui_hidden('what', 'zip'),
+              "<div class='msm-ins-main'><b>Log files as ZIP</b><div class='msm-ins-sub'>The full audit log ",
+              "<span class='msm-path'>", &html_escape($alog), "</span>, with a <code>manifest.txt</code> of ",
+              "SHA-256 checksums. Raw logs can contain passwords and cookies sent in requests: keep the file safe.</div>",
+              "<div class='msm-filters' style='margin:8px 0 0'><select name='rotated'>$opts</select>",
+              "<label><input type='checkbox' name='error_log' value='1'> Also the Apache error log (",
+              &html_escape(human_size($size_of->($p{error_log}, 0))), ")</label></div></div>",
+              "<div class='msm-ins-side'><button type='submit' class='msm-btn'>", icon('package', 15),
+              "Download ZIP</button></div></form>\n";
+    }
+    print "</div>\n";
 }
 
 my @show = @$raw > 500 ? @$raw[-500 .. -1] : @$raw;

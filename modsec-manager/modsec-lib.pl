@@ -2772,6 +2772,145 @@ sub sync_block_cron {
 }
 
 # ---------------------------------------------------------------------------
+# Logs page filters and export
+# ---------------------------------------------------------------------------
+
+# Logs page filters from form input. Returns ($source, \%filters).
+sub logs_filters {
+    my ($in) = @_;
+    my $source = ($in->{'source'} || '') eq 'error' ? 'error' : 'audit';
+    my %f;
+    foreach my $k ('rule', 'ip', 'host', 'path', 'site') {
+        $f{$k} = defined($in->{$k}) ? $in->{$k} : '';
+        $f{$k} =~ s/[\r\n]//g;
+    }
+    $f{blocked} = $in->{'blocked'} ? 1 : 0;
+    $f{history} = ($in->{'history'} || 0) =~ /^([0-7])$/ ? $1 : 0;
+    return ($source, \%f);
+}
+
+# Events matching the filters. A site filter matches its ServerName and
+# every ServerAlias. Returns ($raw_lines, $all_txs, $file, $error, \@txs, \@vhosts).
+sub logs_select {
+    my ($source, $f) = @_;
+    my ($raw, $all, $file, $err) = read_recent_log($source, $f->{history});
+    my @vhosts = apache_vhosts();
+    my $site_hosts;
+    if ($f->{site} ne '') {
+        my ($v) = grep { $_->{name} eq norm_host($f->{site}) } @vhosts;
+        $site_hosts = { map { $_ => 1 } ($v ? ($v->{name}, grep { !/[*?]/ } @{$v->{aliases}}) : norm_host($f->{site})) };
+    }
+    my @txs = filter_transactions($all, %$f, hosts => $site_hosts);
+    return ($raw, $all, $file, $err, \@txs, \@vhosts);
+}
+
+# One CSV field. Values starting with = + - @ (attacker-controlled URIs and
+# headers) are prefixed with ' so spreadsheets do not run them as formulas.
+sub csv_field {
+    my ($v) = @_;
+    $v = '' if (!defined($v));
+    $v =~ s/[\r\n]+/ /g;
+    $v = "'$v" if ($v =~ /^[=+\-\@\t]/ && length($v) > 1);
+    return $v =~ /[",;\s]/ || $v eq '' ? '"' . join('""', split(/"/, $v, -1)) . '"' : $v;
+}
+
+# Events as CSV text (UTF-8 with a byte order mark, for Excel).
+sub events_csv {
+    my ($txs, $vhosts) = @_;
+    my @cols = ('Time', 'Transaction', 'Client IP', 'Host', 'Site', 'Method', 'URI', 'Status', 'Blocked',
+                'Rule IDs', 'Messages', 'Matched data');
+    my $out = "\xEF\xBB\xBF" . join(',', map { csv_field($_) } @cols) . "\r\n";
+    foreach my $tx (@$txs) {
+        my ($method, $uri) = ($tx->{request} || '') =~ /^([A-Z]+)\s+(\S+)/ ? ($1, $2) : ('', $tx->{request} || '');
+        my @m = grep { !is_score_rule($_->{id} || '') } @{$tx->{messages}};
+        @m = @{$tx->{messages}} if (!@m);
+        my %seen;
+        my @ids = grep { $_ ne '' && !$seen{$_}++ } map { $_->{id} || '' } @{$tx->{messages}};
+        my @row = ($tx->{time}, $tx->{id} || '', $tx->{client}, $tx->{host},
+                   site_for_host($tx->{host}, $vhosts), $method, $uri, $tx->{status},
+                   tx_blocked($tx) ? 'yes' : 'no', join(' ', @ids),
+                   join(' | ', grep { $_ ne '' } map { $_->{msg} || '' } @m),
+                   join(' | ', grep { $_ ne '' } map { $_->{data} || '' } @m));
+        $out .= join(',', map { csv_field($_) } @row) . "\r\n";
+    }
+    return $out;
+}
+
+# Log files for a ZIP export: the current file and up to $history rotated
+# copies (file.1, file.2.gz, ...). Returns list of [path, size].
+sub log_files_with_rotated {
+    my ($file, $history) = @_;
+    my @f;
+    push(@f, $file) if (-r $file);
+    for (my $i = 1; $i <= $history && $i <= 7; $i++) {
+        my ($r) = grep { -r $_ } ("$file.$i", "$file.$i.gz");
+        push(@f, $r) if ($r);
+    }
+    return map { [$_, -s $_ || 0] } @f;
+}
+
+# File name part for downloads: host name and local time.
+sub export_stamp {
+    my $host = defined(&get_system_hostname) ? &get_system_hostname() : 'server';
+    $host =~ s/[^A-Za-z0-9.-]+/-/g;
+    return $host . "-" . POSIX::strftime("%Y%m%d-%H%M", localtime(time()));
+}
+
+# Write a ZIP of the log files @$files to $out (default STDOUT) as it reads
+# them, so large logs never sit in memory. Files that are already gzip
+# compressed are stored as they are. The last entry is manifest.txt:
+# $note, then the size and SHA-256 of every file, so a copy handed on can be
+# checked later. Returns '' or an error.
+sub stream_zip {
+    my ($files, $note, $out) = @_;
+    require IO::Compress::Zip;
+    require Digest::SHA;
+    $out ||= \*STDOUT;
+    my $total = 0;
+    $total += (-s $_ || 0) foreach (@$files);
+    my %o = (Stream => 1, Zip64 => $total > 3_500_000_000 ? 1 : 0, BinModeIn => 1);
+    binmode($out);
+    my ($z, %used, @manifest);
+    my $add = sub {
+        my ($name, %e) = @_;
+        if (!$z) {
+            $z = IO::Compress::Zip->new($out, %o, Name => $name, %e);
+            return $z ? '' : "Cannot start the ZIP file: $IO::Compress::Zip::ZipError";
+        }
+        return $z->newStream(%o, Name => $name, %e) ? '' : "Cannot add $name: $IO::Compress::Zip::ZipError";
+    };
+    foreach my $f (@$files) {
+        open(my $in, '<', $f) || next;
+        binmode($in);
+        # Two logs with the same name (unlikely) keep their parent folder.
+        (my $name = $f) =~ s#^.*/##;
+        if ($used{$name}++) {
+            ($name = $f) =~ s#^/+##;
+            $name =~ s#/#_#g;
+        }
+        my $err = $add->($name, Time => (stat($f))[9],
+                         ($f =~ /\.gz$/ ? (Method => IO::Compress::Zip::ZIP_CM_STORE()) : ()));
+        return $err if ($err);
+        my $sha = Digest::SHA->new(256);
+        my ($buf, $size) = ('', 0);
+        while (my $n = read($in, $buf, 1 << 20)) {
+            $z->print($buf);
+            $sha->add($buf);
+            $size += $n;
+        }
+        close($in);
+        push(@manifest, sprintf("%s  %12d  %s  (%s)", $sha->hexdigest, $size, $name, $f));
+    }
+    return 'None of the log files could be read' if (!$z);
+    my $err = $add->('manifest.txt', Time => time());
+    return $err if ($err);
+    $z->print(($note || '') . "\nSHA-256                                                           Bytes  File\n" .
+              join("\n", @manifest) . "\n");
+    $z->close();
+    return '';
+}
+
+# ---------------------------------------------------------------------------
 # HTML helpers and design system
 # ---------------------------------------------------------------------------
 
